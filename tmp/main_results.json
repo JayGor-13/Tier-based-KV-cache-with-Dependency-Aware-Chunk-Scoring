@@ -1,0 +1,40 @@
+{
+  "config": {
+    "trace_path": "tmp/sample_trace.jsonl",
+    "budget": 10,
+    "theta": 0.3,
+    "recent_window": 4,
+    "method": "tdc_kv"
+  },
+  "summary": {
+    "count": 1,
+    "avg_retention_ratio": 0.75,
+    "avg_compression_ratio": 0.25,
+    "avg_budget_gap": -1.0,
+    "avg_latency_ms": 21.942300023511052,
+    "p50_latency_ms": 21.942300023511052,
+    "p90_latency_ms": 21.942300023511052
+  },
+  "runs": [
+    {
+      "sample_id": "smoke_1",
+      "budget": 10,
+      "kept_tokens": 9,
+      "removed_tokens": 3,
+      "tier0_chunks": 2,
+      "tier1_chunks": 0,
+      "tier2_chunks": 3,
+      "metrics": {
+        "sample_id": "smoke_1",
+        "original_length": 12,
+        "budget": 10,
+        "kept_length": 9,
+        "removed_length": 3,
+        "retention_ratio": 0.75,
+        "compression_ratio": 0.25,
+        "budget_gap": -1,
+        "latency_ms": 21.942300023511052
+      }
+    }
+  ]
+}

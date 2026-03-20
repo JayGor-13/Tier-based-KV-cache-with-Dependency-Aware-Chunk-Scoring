@@ -1,0 +1,106 @@
+{
+  "config": {
+    "trace_path": "tmp/sample_trace.jsonl",
+    "methods": [
+      "chunkkv",
+      "snapkv",
+      "h2o"
+    ],
+    "budget": 10,
+    "theta": 0.3,
+    "recent_window": 4,
+    "heavy_hitter_ratio": 0.7
+  },
+  "results": {
+    "chunkkv": {
+      "summary": {
+        "count": 1,
+        "avg_retention_ratio": 0.75,
+        "avg_compression_ratio": 0.25,
+        "avg_budget_gap": -1.0,
+        "avg_latency_ms": 28.618099982850254,
+        "p50_latency_ms": 28.618099982850254,
+        "p90_latency_ms": 28.618099982850254
+      },
+      "runs": [
+        {
+          "sample_id": "smoke_1",
+          "budget": 10,
+          "kept_tokens": 9,
+          "removed_tokens": 3,
+          "metrics": {
+            "sample_id": "smoke_1",
+            "original_length": 12,
+            "budget": 10,
+            "kept_length": 9,
+            "removed_length": 3,
+            "retention_ratio": 0.75,
+            "compression_ratio": 0.25,
+            "budget_gap": -1,
+            "latency_ms": 28.618099982850254
+          }
+        }
+      ]
+    },
+    "snapkv": {
+      "summary": {
+        "count": 1,
+        "avg_retention_ratio": 0.8333333333333334,
+        "avg_compression_ratio": 0.16666666666666663,
+        "avg_budget_gap": 0.0,
+        "avg_latency_ms": 1.4587999903596938,
+        "p50_latency_ms": 1.4587999903596938,
+        "p90_latency_ms": 1.4587999903596938
+      },
+      "runs": [
+        {
+          "sample_id": "smoke_1",
+          "budget": 10,
+          "kept_tokens": 10,
+          "removed_tokens": 2,
+          "metrics": {
+            "sample_id": "smoke_1",
+            "original_length": 12,
+            "budget": 10,
+            "kept_length": 10,
+            "removed_length": 2,
+            "retention_ratio": 0.8333333333333334,
+            "compression_ratio": 0.16666666666666663,
+            "budget_gap": 0,
+            "latency_ms": 1.4587999903596938
+          }
+        }
+      ]
+    },
+    "h2o": {
+      "summary": {
+        "count": 1,
+        "avg_retention_ratio": 0.8333333333333334,
+        "avg_compression_ratio": 0.16666666666666663,
+        "avg_budget_gap": 0.0,
+        "avg_latency_ms": 11.864500003866851,
+        "p50_latency_ms": 11.864500003866851,
+        "p90_latency_ms": 11.864500003866851
+      },
+      "runs": [
+        {
+          "sample_id": "smoke_1",
+          "budget": 10,
+          "kept_tokens": 10,
+          "removed_tokens": 2,
+          "metrics": {
+            "sample_id": "smoke_1",
+            "original_length": 12,
+            "budget": 10,
+            "kept_length": 10,
+            "removed_length": 2,
+            "retention_ratio": 0.8333333333333334,
+            "compression_ratio": 0.16666666666666663,
+            "budget_gap": 0,
+            "latency_ms": 11.864500003866851
+          }
+        }
+      ]
+    }
+  }
+}
