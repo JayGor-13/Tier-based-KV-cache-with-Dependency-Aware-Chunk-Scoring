@@ -1,0 +1,6 @@
+.conda-env/
+.venv/
+.pytest_cache/
+pytest-cache-files-*/
+__pycache__/
+*.pyc
