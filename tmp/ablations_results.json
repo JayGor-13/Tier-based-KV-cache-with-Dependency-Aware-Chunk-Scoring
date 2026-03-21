@@ -1,0 +1,27 @@
+{
+  "config": {
+    "trace_path": "tmp/sample_trace.jsonl",
+    "budget": 10,
+    "theta_grid": [
+      0.3
+    ],
+    "recent_window_grid": [
+      4
+    ]
+  },
+  "ablations": [
+    {
+      "theta": 0.3,
+      "recent_window": 4,
+      "summary": {
+        "count": 1,
+        "avg_retention_ratio": 0.75,
+        "avg_compression_ratio": 0.25,
+        "avg_budget_gap": -1.0,
+        "avg_latency_ms": 19.33059998555109,
+        "p50_latency_ms": 19.33059998555109,
+        "p90_latency_ms": 19.33059998555109
+      }
+    }
+  ]
+}
