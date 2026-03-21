@@ -1,0 +1,10 @@
+﻿name: tdc-kv
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pytest
+  - pip:
+      - torch
+      - numpy
