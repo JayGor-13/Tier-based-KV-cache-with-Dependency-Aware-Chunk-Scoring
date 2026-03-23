@@ -14,8 +14,10 @@ from benchmarks.eval_metrics import CacheMetrics, compute_cache_metrics
 from src.baselines.chunkkv import evict_chunkkv
 from src.baselines.h2o import evict_h2o
 from src.baselines.snapkv import evict_snapkv
+from src.core.chunker import MIN_CHUNK_TOKENS
 from src.core.evictor import EvictionResult, evict_kv_cache
 from src.core.masker import assign_protection_tiers, infer_sequence_length
+from src.core.pipeline import build_tdc_kv_pipeline
 
 
 @dataclass
@@ -25,6 +27,8 @@ class TraceSample:
     chunk_scores: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
+    token_ids: torch.Tensor | None = None
+    punct_ids: set[int] | None = None
     budget: int | None = None
     attention_obs: torch.Tensor | None = None
     gold: str | None = None
@@ -121,6 +125,16 @@ def parse_trace_record(record: dict[str, Any], *, sample_index: int = 0) -> Trac
         chunk_scores=chunk_scores,
         k_cache=k_cache,
         v_cache=v_cache,
+        token_ids=(
+            _to_tensor(record["token_ids"], dtype=torch.long)
+            if "token_ids" in record
+            else None
+        ),
+        punct_ids=(
+            set(int(x) for x in record["punct_ids"])
+            if "punct_ids" in record
+            else None
+        ),
         budget=record.get("budget"),
         attention_obs=attention_obs,
         gold=record.get("gold"),
@@ -173,6 +187,7 @@ def run_tdc_policy(
     budget: int,
     theta: float = 0.3,
     recent_window: int = 16,
+    allow_level2_fallback: bool = False,
 ) -> tuple[EvictionResult, torch.Tensor, CacheMetrics]:
     tiers = assign_protection_tiers(
         chunk_scores=sample.chunk_scores,
@@ -189,6 +204,7 @@ def run_tdc_policy(
         k_cache=sample.k_cache,
         v_cache=sample.v_cache,
         budget=budget,
+        allow_level2_fallback=allow_level2_fallback,
     )
     latency_ms = (time.perf_counter() - t0) * 1000.0
     metrics = compute_cache_metrics(
@@ -199,6 +215,68 @@ def run_tdc_policy(
         latency_ms=latency_ms,
     )
     return result, tiers, metrics
+
+
+def run_tdc_full_pipeline_policy(
+    sample: TraceSample,
+    *,
+    budget: int,
+    theta: float = 0.3,
+    recent_window: int = 16,
+    punct_ids: set[int] | None = None,
+    min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+    alpha: float = 0.6,
+    beta: float = 0.4,
+    window_size: int = 16,
+    num_layers: int | None = None,
+    allow_level2_fallback: bool = False,
+) -> tuple[EvictionResult, torch.Tensor, CacheMetrics, torch.Tensor]:
+    """Run complete Module1->Module2->Module3->Module4 pipeline on one sample."""
+    if sample.token_ids is None:
+        raise ValueError(
+            "Full TDC pipeline requires `token_ids` in the trace sample."
+        )
+    if sample.attention_obs is None:
+        raise ValueError(
+            "Full TDC pipeline requires `attention_obs` in the trace sample."
+        )
+
+    merged_punct_ids = punct_ids if punct_ids is not None else sample.punct_ids
+    if merged_punct_ids is None:
+        raise ValueError(
+            "Full TDC pipeline requires punctuation token ids. "
+            "Provide `punct_ids` in trace or via function argument."
+        )
+
+    pipeline = build_tdc_kv_pipeline(
+        punct_ids=merged_punct_ids,
+        min_chunk_tokens=min_chunk_tokens,
+        alpha=alpha,
+        beta=beta,
+        window_size=window_size,
+        num_layers=num_layers,
+        theta=theta,
+        recent_window=recent_window,
+        allow_level2_fallback=allow_level2_fallback,
+        device=sample.k_cache.device,
+    )
+    t0 = time.perf_counter()
+    outputs = pipeline.run(
+        token_ids=sample.token_ids,
+        attention_obs=sample.attention_obs,
+        k_cache=sample.k_cache,
+        v_cache=sample.v_cache,
+        budget=budget,
+    )
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    metrics = compute_cache_metrics(
+        sample_id=sample.sample_id,
+        original_length=sample.sequence_length,
+        budget=budget,
+        kept_length=int(outputs.eviction.kept_indices.numel()),
+        latency_ms=latency_ms,
+    )
+    return outputs.eviction, outputs.mask_tiers, metrics, outputs.chunk_scores
 
 
 def run_baseline_policy(
@@ -265,5 +343,6 @@ __all__ = [
     "load_trace_samples",
     "parse_trace_record",
     "run_baseline_policy",
+    "run_tdc_full_pipeline_policy",
     "run_tdc_policy",
 ]

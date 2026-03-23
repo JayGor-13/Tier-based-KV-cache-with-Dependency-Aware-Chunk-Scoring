@@ -77,6 +77,36 @@ def evict_h2o(
     )
 
     forced_count = int(keep_mask.sum().item())
+    if forced_count > budget:
+        # Enforce strict budget even when forced sink+recent tokens exceed capacity.
+        # Priority: sink tokens first, then newest tokens (recency), then highest-score leftovers.
+        trimmed_keep = torch.zeros_like(keep_mask)
+
+        if sink_tokens > 0 and budget > 0:
+            sink_keep = min(sink_tokens, t, budget)
+            trimmed_keep[:sink_keep] = True
+
+        slots_left = budget - int(trimmed_keep.sum().item())
+        if slots_left > 0 and recent_window > 0:
+            recent_start = max(t - recent_window, 0)
+            recent_idx = torch.arange(recent_start, t, device=k_cache.device)
+            recent_idx = recent_idx[~trimmed_keep[recent_idx]]
+            if recent_idx.numel() > 0:
+                take = min(slots_left, int(recent_idx.numel()))
+                # Keep newest tokens first from recent region.
+                trimmed_keep[recent_idx[-take:]] = True
+                slots_left = budget - int(trimmed_keep.sum().item())
+
+        if slots_left > 0:
+            forced_candidates = keep_mask & ~trimmed_keep
+            extra_idx = topk_from_candidates(scores, forced_candidates, slots_left)
+            trimmed_keep[extra_idx] = True
+
+        keep_mask = trimmed_keep
+        return build_result_from_keep_mask(
+            keep_mask=keep_mask, k_cache=k_cache, v_cache=v_cache, budget=budget
+        )
+
     remaining_capacity = max(min(budget, t) - forced_count, 0)
     if remaining_capacity <= 0:
         return build_result_from_keep_mask(

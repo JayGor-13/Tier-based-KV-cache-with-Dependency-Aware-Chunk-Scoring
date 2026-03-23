@@ -37,6 +37,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="outputs/main_results.json",
         help="Output JSON file.",
     )
+    parser.add_argument(
+        "--allow-level2-fallback",
+        action="store_true",
+        help="Allow eviction from Tier-2 chunks when Tier-0/1 cannot satisfy budget.",
+    )
     return parser
 
 
@@ -59,6 +64,7 @@ def main() -> None:
             budget=budget,
             theta=args.theta,
             recent_window=args.recent_window,
+            allow_level2_fallback=args.allow_level2_fallback,
         )
         metric_rows.append(metrics)
         run_rows.append(
@@ -82,6 +88,7 @@ def main() -> None:
             "theta": args.theta,
             "recent_window": args.recent_window,
             "method": "tdc_kv",
+            "allow_level2_fallback": args.allow_level2_fallback,
         },
         "summary": summary,
         "runs": run_rows,

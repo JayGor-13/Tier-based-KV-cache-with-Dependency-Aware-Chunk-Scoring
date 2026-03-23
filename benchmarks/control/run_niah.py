@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--budget", type=int, default=None)
     parser.add_argument("--theta", type=float, default=0.3)
     parser.add_argument("--recent-window", type=int, default=16)
+    parser.add_argument("--allow-level2-fallback", action="store_true")
     parser.add_argument("--output", type=str, default="outputs/bench_niah.json")
     args = parser.parse_args()
 
@@ -29,6 +30,7 @@ def main() -> None:
         budget=args.budget,
         theta=args.theta,
         recent_window=args.recent_window,
+        allow_level2_fallback=args.allow_level2_fallback,
     )
     print(f"Wrote NIAH benchmark to {args.output}")
     print(payload["cache_summary"])

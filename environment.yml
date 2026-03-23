@@ -8,3 +8,5 @@ dependencies:
   - pip:
       - torch
       - numpy
+      - transformers
+      - matplotlib

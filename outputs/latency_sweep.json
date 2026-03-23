@@ -1,0 +1,133 @@
+{
+  "config": {
+    "sequence_lengths": [
+      512,
+      2048,
+      8192
+    ],
+    "methods": [
+      "tdc_kv"
+    ],
+    "budget_ratio": 0.5,
+    "window_size": 16,
+    "recent_window": 16,
+    "theta": 0.3,
+    "alpha": 0.6,
+    "beta": 0.4,
+    "min_chunk_tokens": 5,
+    "chunk_stride": 32,
+    "num_heads": 8,
+    "head_dim": 64,
+    "heavy_hitter_ratio": 0.7,
+    "repeats": 30,
+    "warmup_runs": 5,
+    "seed": 42,
+    "allow_level2_fallback": true
+  },
+  "results": {
+    "512": {
+      "tdc_kv": {
+        "sequence_length": 512,
+        "budget": 256,
+        "method": "tdc_kv",
+        "repeats": 30,
+        "warmup_runs": 5,
+        "measured_runs": 25,
+        "avg_latency_ms": 13.595279986038804,
+        "std_latency_ms": 1.5655170861382526,
+        "kept_tokens": 256,
+        "removed_tokens": 256,
+        "retention_ratio": 0.5,
+        "compression_ratio": 0.5,
+        "failed": false,
+        "error": ""
+      }
+    },
+    "2048": {
+      "tdc_kv": {
+        "sequence_length": 2048,
+        "budget": 1024,
+        "method": "tdc_kv",
+        "repeats": 30,
+        "warmup_runs": 5,
+        "measured_runs": 25,
+        "avg_latency_ms": 36.58844801597297,
+        "std_latency_ms": 3.1649974429244043,
+        "kept_tokens": 1024,
+        "removed_tokens": 1024,
+        "retention_ratio": 0.5,
+        "compression_ratio": 0.5,
+        "failed": false,
+        "error": ""
+      }
+    },
+    "8192": {
+      "tdc_kv": {
+        "sequence_length": 8192,
+        "budget": 4096,
+        "method": "tdc_kv",
+        "repeats": 30,
+        "warmup_runs": 5,
+        "measured_runs": 25,
+        "avg_latency_ms": 102.93218799401075,
+        "std_latency_ms": 22.781708415102738,
+        "kept_tokens": 4096,
+        "removed_tokens": 4096,
+        "retention_ratio": 0.5,
+        "compression_ratio": 0.5,
+        "failed": false,
+        "error": ""
+      }
+    }
+  },
+  "rows": [
+    {
+      "sequence_length": 512,
+      "budget": 256,
+      "method": "tdc_kv",
+      "repeats": 30,
+      "warmup_runs": 5,
+      "measured_runs": 25,
+      "avg_latency_ms": 13.595279986038804,
+      "std_latency_ms": 1.5655170861382526,
+      "kept_tokens": 256,
+      "removed_tokens": 256,
+      "retention_ratio": 0.5,
+      "compression_ratio": 0.5,
+      "failed": false,
+      "error": ""
+    },
+    {
+      "sequence_length": 2048,
+      "budget": 1024,
+      "method": "tdc_kv",
+      "repeats": 30,
+      "warmup_runs": 5,
+      "measured_runs": 25,
+      "avg_latency_ms": 36.58844801597297,
+      "std_latency_ms": 3.1649974429244043,
+      "kept_tokens": 1024,
+      "removed_tokens": 1024,
+      "retention_ratio": 0.5,
+      "compression_ratio": 0.5,
+      "failed": false,
+      "error": ""
+    },
+    {
+      "sequence_length": 8192,
+      "budget": 4096,
+      "method": "tdc_kv",
+      "repeats": 30,
+      "warmup_runs": 5,
+      "measured_runs": 25,
+      "avg_latency_ms": 102.93218799401075,
+      "std_latency_ms": 22.781708415102738,
+      "kept_tokens": 4096,
+      "removed_tokens": 4096,
+      "retention_ratio": 0.5,
+      "compression_ratio": 0.5,
+      "failed": false,
+      "error": ""
+    }
+  ]
+}
