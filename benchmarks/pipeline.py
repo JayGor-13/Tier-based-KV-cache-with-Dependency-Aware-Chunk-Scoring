@@ -17,7 +17,7 @@ from src.baselines.snapkv import evict_snapkv
 from src.core.chunker import MIN_CHUNK_TOKENS
 from src.core.evictor import EvictionResult, evict_kv_cache
 from src.core.masker import assign_protection_tiers, infer_sequence_length
-from src.core.pipeline import build_tdc_kv_pipeline
+from src.core.pipeline import TDCKVPipeline, build_tdc_kv_pipeline
 
 
 @dataclass
@@ -230,6 +230,7 @@ def run_tdc_full_pipeline_policy(
     window_size: int = 16,
     num_layers: int | None = None,
     allow_level2_fallback: bool = False,
+    pipeline: TDCKVPipeline | None = None,
 ) -> tuple[EvictionResult, torch.Tensor, CacheMetrics, torch.Tensor]:
     """Run complete Module1->Module2->Module3->Module4 pipeline on one sample."""
     if sample.token_ids is None:
@@ -248,18 +249,21 @@ def run_tdc_full_pipeline_policy(
             "Provide `punct_ids` in trace or via function argument."
         )
 
-    pipeline = build_tdc_kv_pipeline(
-        punct_ids=merged_punct_ids,
-        min_chunk_tokens=min_chunk_tokens,
-        alpha=alpha,
-        beta=beta,
-        window_size=window_size,
-        num_layers=num_layers,
-        theta=theta,
-        recent_window=recent_window,
-        allow_level2_fallback=allow_level2_fallback,
-        device=sample.k_cache.device,
-    )
+    if pipeline is None:
+        pipeline = build_tdc_kv_pipeline(
+            punct_ids=merged_punct_ids,
+            min_chunk_tokens=min_chunk_tokens,
+            alpha=alpha,
+            beta=beta,
+            window_size=window_size,
+            num_layers=num_layers,
+            theta=theta,
+            recent_window=recent_window,
+            allow_level2_fallback=allow_level2_fallback,
+            device=sample.k_cache.device,
+        )
+    if hasattr(pipeline.scorer, "reset_state"):
+        pipeline.scorer.reset_state()
     t0 = time.perf_counter()
     outputs = pipeline.run(
         token_ids=sample.token_ids,

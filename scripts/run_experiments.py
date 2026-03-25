@@ -21,6 +21,7 @@ from benchmarks.pipeline import (
     run_tdc_policy,
 )
 from src.core.chunker import MIN_CHUNK_TOKENS
+from src.core.pipeline import build_tdc_kv_pipeline
 
 
 DEFAULT_BENCHMARK_TRACES: dict[str, str] = {
@@ -248,6 +249,24 @@ def main() -> None:
                     result = None
                     tiers = None
                     chunk_scores = None
+                    shared_pipeline = None
+                    if method == "tdc_kv" and args.full_pipeline:
+                        merged_punct_ids = (
+                            punct_ids if punct_ids is not None else sample.punct_ids
+                        )
+                        if merged_punct_ids is not None:
+                            shared_pipeline = build_tdc_kv_pipeline(
+                                punct_ids=merged_punct_ids,
+                                min_chunk_tokens=args.min_chunk_tokens,
+                                alpha=args.alpha,
+                                beta=args.beta,
+                                window_size=args.window_size,
+                                num_layers=args.num_layers,
+                                theta=args.theta,
+                                recent_window=args.recent_window,
+                                allow_level2_fallback=args.allow_level2_fallback,
+                                device=sample.k_cache.device,
+                            )
                     for run_idx in range(total_runs):
                         t0 = time.perf_counter()
                         if method == "tdc_kv":
@@ -264,6 +283,7 @@ def main() -> None:
                                     window_size=args.window_size,
                                     num_layers=args.num_layers,
                                     allow_level2_fallback=args.allow_level2_fallback,
+                                    pipeline=shared_pipeline,
                                 )
                             else:
                                 run_result, run_tiers, _ = run_tdc_policy(

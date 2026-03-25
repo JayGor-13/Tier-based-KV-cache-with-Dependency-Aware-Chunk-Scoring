@@ -22,6 +22,7 @@ from benchmarks.pipeline import (
     run_tdc_full_pipeline_policy,
 )
 from src.core.chunker import MIN_CHUNK_TOKENS, SentenceBoundaryChunkConstructor
+from src.core.pipeline import build_tdc_kv_pipeline
 from src.core.scorer import DualSignalScorer
 
 
@@ -248,6 +249,19 @@ def main() -> None:
             removed_tokens = 0
             failed = False
             error_msg = ""
+            shared_pipeline = None
+            if method == "tdc_kv":
+                shared_pipeline = build_tdc_kv_pipeline(
+                    punct_ids={99},
+                    min_chunk_tokens=args.min_chunk_tokens,
+                    alpha=args.alpha,
+                    beta=args.beta,
+                    window_size=args.window_size,
+                    theta=args.theta,
+                    recent_window=args.recent_window,
+                    allow_level2_fallback=args.allow_level2_fallback,
+                    device=sample.k_cache.device,
+                )
             for run_i in range(repeats):
                 try:
                     t0 = time.perf_counter()
@@ -263,6 +277,7 @@ def main() -> None:
                             beta=args.beta,
                             window_size=args.window_size,
                             allow_level2_fallback=args.allow_level2_fallback,
+                            pipeline=shared_pipeline,
                         )
                     else:
                         result, _ = run_baseline_policy(

@@ -106,8 +106,9 @@ class DualSignalScorer:
         R_token = self._fallback_r_vector(M_token)
         window_start = max(t - w, 0)
 
-        # R_window[q] = sum_h sum_i A[h,q,i] * M[i], for q in observation window.
-        R_window = (A * M_token[None, None, :]).sum(dim=2).sum(dim=0)  # [w]
+        # R_window[q] = mean_h sum_i A[h,q,i] * M[i], for q in observation window.
+        # Using head-mean avoids artificial head-count amplification.
+        R_window = (A * M_token[None, None, :]).sum(dim=2).mean(dim=0)  # [w]
         actual_window_len = t - window_start
         R_token[window_start:t] = R_window[:actual_window_len]
         self._commit_r_state(R_token)
@@ -129,7 +130,7 @@ class DualSignalScorer:
         window_start = max(t - w, 0)
 
         # Per-layer routing window: [L,w]
-        Rw_per_layer = (A * M_per_layer[:, None, None, :]).sum(dim=3).sum(dim=1)
+        Rw_per_layer = (A * M_per_layer[:, None, None, :]).sum(dim=3).mean(dim=1)
         R_window = (layer_w[:, None] * Rw_per_layer).sum(dim=0)  # [w]
         actual_window_len = t - window_start
         R_token[window_start:t] = R_window[:actual_window_len]
@@ -209,4 +210,3 @@ def build_module2(
         r_fallback_mode=r_fallback_mode,
         ema_decay=ema_decay,
     )
-
