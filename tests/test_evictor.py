@@ -69,3 +69,33 @@ def test_evict_kv_cache_raises_when_only_tier2_exists():
             v_cache=v_cache,
             budget=6,
         )
+
+
+def test_compute_keep_mask_rejects_overlapping_chunks():
+    chunks, scores = _build_inputs()
+    chunks[1] = torch.tensor([1, 2], dtype=torch.long)  # overlap at token 1
+    tiers = torch.tensor([2, 0, 0, 1, 2], dtype=torch.int8)
+
+    with pytest.raises(ValueError):
+        compute_keep_mask(
+            mask_tiers=tiers,
+            chunk_scores=scores,
+            chunks=chunks,
+            sequence_length=10,
+            budget=6,
+        )
+
+
+def test_compute_keep_mask_rejects_out_of_range_indices():
+    chunks, scores = _build_inputs()
+    chunks[-1] = torch.tensor([8, 10], dtype=torch.long)  # 10 out of range for t=10
+    tiers = torch.tensor([2, 0, 0, 1, 2], dtype=torch.int8)
+
+    with pytest.raises(IndexError):
+        compute_keep_mask(
+            mask_tiers=tiers,
+            chunk_scores=scores,
+            chunks=chunks,
+            sequence_length=10,
+            budget=6,
+        )

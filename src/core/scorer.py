@@ -162,7 +162,25 @@ class DualSignalScorer:
     def _validate_chunks(self, chunks: list[Tensor], t: int) -> None:
         if len(chunks) == 0:
             raise ValueError("chunks list is empty - Module 1 produced no chunks.")
-        del t
+        seen = torch.zeros(t, dtype=torch.bool, device=self.device)
+        for chunk_idx, chunk in enumerate(chunks):
+            if chunk.ndim != 1:
+                raise ValueError(f"Chunk {chunk_idx} must be 1D, got ndim={chunk.ndim}.")
+            if chunk.numel() == 0:
+                continue
+            idx = chunk.to(device=self.device, dtype=torch.long)
+            min_idx = int(idx.min().item())
+            max_idx = int(idx.max().item())
+            if min_idx < 0 or max_idx >= t:
+                raise ValueError(
+                    f"Chunk {chunk_idx} has out-of-range token indices [{min_idx}, {max_idx}] "
+                    f"for sequence length {t}."
+                )
+            if bool(seen[idx].any().item()):
+                raise ValueError(
+                    f"Chunk {chunk_idx} overlaps with another chunk; chunk indices must be disjoint."
+                )
+            seen[idx] = True
 
     def update_scores(
         self,

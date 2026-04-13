@@ -21,6 +21,23 @@ The full pipeline now runs:
 pytest -q
 ```
 
+Pipeline health checks (Stage A + C by default, optional Stage B real-model smoke):
+
+```bash
+python scripts/run_pipeline_health_checks.py \
+  --trace-path tmp/sample_trace.jsonl \
+  --output outputs/pipeline_health_report.json
+```
+
+Enable model smoke stage explicitly:
+
+```bash
+python scripts/run_pipeline_health_checks.py \
+  --trace-path tmp/sample_trace.jsonl \
+  --run-model-smoke \
+  --model-name microsoft/Phi-3-mini-4k-instruct
+```
+
 ## Unified experiment control (our model + baselines + benchmark selection)
 
 Use:

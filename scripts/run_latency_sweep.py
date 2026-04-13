@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 import sys
 import time
+import traceback
 from typing import Any
 
 import torch
@@ -249,6 +250,7 @@ def main() -> None:
             removed_tokens = 0
             failed = False
             error_msg = ""
+            error_type = ""
             shared_pipeline = None
             if method == "tdc_kv":
                 shared_pipeline = build_tdc_kv_pipeline(
@@ -295,7 +297,14 @@ def main() -> None:
                         removed_tokens = int(result.removed_indices.numel())
                 except Exception as exc:  # noqa: BLE001
                     failed = True
+                    error_type = type(exc).__name__
                     error_msg = str(exc)
+                    print(
+                        f"[WARN] latency-sweep method={method} seq_len={seq_len} "
+                        f"failed with {error_type}: {error_msg}",
+                        file=sys.stderr,
+                    )
+                    print(traceback.format_exc(), file=sys.stderr)
                     break
 
             row = {
@@ -312,6 +321,7 @@ def main() -> None:
                 "retention_ratio": (kept_tokens / float(seq_len)) if seq_len > 0 else 1.0,
                 "compression_ratio": (removed_tokens / float(seq_len)) if seq_len > 0 else 0.0,
                 "failed": failed,
+                "error_type": error_type,
                 "error": error_msg,
             }
             rows.append(row)

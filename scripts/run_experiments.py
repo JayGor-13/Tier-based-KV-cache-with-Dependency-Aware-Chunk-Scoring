@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import time
+import traceback
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -233,6 +234,7 @@ def main() -> None:
             metric_rows = []
             runs = []
             failed_runs = 0
+            failure_reasons: dict[str, int] = {}
             for sample in samples:
                 budget = int(args.budget if args.budget is not None else (sample.budget or 0))
                 if budget <= 0:
@@ -322,10 +324,19 @@ def main() -> None:
                     if args.fail_fast:
                         raise
                     failed_runs += 1
+                    error_type = type(exc).__name__
+                    failure_reasons[error_type] = failure_reasons.get(error_type, 0) + 1
+                    print(
+                        f"[WARN] benchmark={bench} method={method} sample={sample.sample_id} "
+                        f"failed with {error_type}: {exc}",
+                        file=sys.stderr,
+                    )
+                    print(traceback.format_exc(), file=sys.stderr)
                     runs.append(
                         {
                             "sample_id": sample.sample_id,
                             "budget": budget,
+                            "error_type": error_type,
                             "error": str(exc),
                         }
                     )
@@ -368,6 +379,7 @@ def main() -> None:
                 "runs": runs,
                 "metric_rows": metric_rows,
                 "failed_runs": failed_runs,
+                "failure_reasons": failure_reasons,
             }
         per_benchmark[bench] = bench_result
 
@@ -381,6 +393,7 @@ def main() -> None:
                 "summary": method_payload["summary"],
                 "runs": method_payload["runs"],
                 "failed_runs": method_payload["failed_runs"],
+                "failure_reasons": method_payload.get("failure_reasons", {}),
             }
         cleaned_per_benchmark[bench] = {
             "trace_path": payload["trace_path"],

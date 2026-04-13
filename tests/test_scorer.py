@@ -118,6 +118,22 @@ class TestDualSignalScorer(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = scorer.forward(a_obs, [])
 
+    def test_forward_rejects_out_of_range_chunk_indices(self) -> None:
+        scorer = build_module2(window_size=4, device="cpu")
+        a_obs = _make_attention(h=2, w=4, t=12, seed=31)
+        chunks = [torch.tensor([0, 1, 2]), torch.tensor([11, 12])]
+
+        with self.assertRaises(ValueError):
+            _ = scorer.forward(a_obs, chunks)
+
+    def test_forward_rejects_overlapping_chunks(self) -> None:
+        scorer = build_module2(window_size=4, device="cpu")
+        a_obs = _make_attention(h=2, w=4, t=12, seed=32)
+        chunks = [torch.tensor([0, 1, 2]), torch.tensor([2, 3, 4])]
+
+        with self.assertRaises(ValueError):
+            _ = scorer.forward(a_obs, chunks)
+
     def test_uniform_attention_produces_uniform_scores(self) -> None:
         h, w, t = 2, 4, 20
         a_obs = torch.full((h, w, t), 1.0 / t, dtype=torch.float32)

@@ -45,6 +45,25 @@ def _validate_token_indices(indices: torch.Tensor, sequence_length: int) -> None
         )
 
 
+def _validate_chunks(
+    chunks: Sequence[Chunk],
+    sequence_length: int,
+    *,
+    device: torch.device,
+) -> None:
+    seen = torch.zeros(sequence_length, dtype=torch.bool, device=device)
+    for chunk_idx, chunk in enumerate(chunks):
+        idx = _to_index_tensor(chunk, device=device)
+        if idx.numel() == 0:
+            continue
+        _validate_token_indices(idx, sequence_length)
+        if bool(seen[idx].any().item()):
+            raise ValueError(
+                f"Chunk {chunk_idx} overlaps with another chunk; chunk indices must be disjoint."
+            )
+        seen[idx] = True
+
+
 def _remove_chunks_by_priority(
     *,
     keep_mask: torch.Tensor,
@@ -103,6 +122,7 @@ def compute_keep_mask(
         raise ValueError("`sequence_length` must be non-negative.")
 
     keep_mask = torch.ones(sequence_length, dtype=torch.bool, device=chunk_scores.device)
+    _validate_chunks(chunks, sequence_length, device=keep_mask.device)
     if sequence_length <= budget:
         return keep_mask, 0
 
