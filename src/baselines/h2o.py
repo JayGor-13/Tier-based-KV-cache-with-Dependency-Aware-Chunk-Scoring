@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from src.baselines._utils import build_result_from_keep_mask, forced_keep_mask, topk_from_candidates
+from src.baselines._utils import (
+    build_result_from_keep_mask,
+    forced_keep_mask,
+    topk_from_candidates,
+    trim_keep_mask_to_budget,
+)
 from src.core.evictor import EvictionResult
 
 
@@ -79,6 +84,7 @@ def evict_h2o(
     forced_count = int(keep_mask.sum().item())
     remaining_capacity = max(min(budget, t) - forced_count, 0)
     if remaining_capacity <= 0:
+        keep_mask = trim_keep_mask_to_budget(keep_mask, scores, budget)
         return build_result_from_keep_mask(
             keep_mask=keep_mask, k_cache=k_cache, v_cache=v_cache, budget=budget
         )
@@ -97,12 +103,7 @@ def evict_h2o(
         filler_idx = topk_from_candidates(scores, filler_candidates, fill_capacity)
         keep_mask[filler_idx] = True
 
-    if int(keep_mask.sum().item()) > budget:
-        keep_idx = torch.nonzero(keep_mask, as_tuple=False).flatten()
-        keep_scores = scores[keep_idx]
-        drop_n = int(keep_mask.sum().item()) - budget
-        to_drop_local = torch.topk(keep_scores, k=drop_n, largest=False).indices
-        keep_mask[keep_idx[to_drop_local]] = False
+    keep_mask = trim_keep_mask_to_budget(keep_mask, scores, budget)
 
     return build_result_from_keep_mask(
         keep_mask=keep_mask, k_cache=k_cache, v_cache=v_cache, budget=budget

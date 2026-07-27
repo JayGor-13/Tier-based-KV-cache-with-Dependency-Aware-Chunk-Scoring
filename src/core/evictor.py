@@ -102,6 +102,7 @@ def compute_keep_mask(
     if sequence_length < 0:
         raise ValueError("`sequence_length` must be non-negative.")
 
+    mask_tiers = mask_tiers.to(device=chunk_scores.device)
     keep_mask = torch.ones(sequence_length, dtype=torch.bool, device=chunk_scores.device)
     if sequence_length <= budget:
         return keep_mask, 0

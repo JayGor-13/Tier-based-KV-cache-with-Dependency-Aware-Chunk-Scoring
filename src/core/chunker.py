@@ -6,11 +6,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Iterable
+from typing import Any, Iterable
 
 import torch
 from torch import Tensor
-from transformers import PreTrainedTokenizerBase
 
 
 MIN_CHUNK_TOKENS: int = 5
@@ -18,7 +17,7 @@ DEFAULT_BOUNDARY_CHARS: set[str] = {".", ",", "?", "!", ";", ":"}
 
 
 def build_punctuation_vocab(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: Any,
     boundary_chars: set[str] | None = None,
 ) -> set[int]:
     """
@@ -45,7 +44,7 @@ class SentenceBoundaryChunkConstructor:
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizerBase | None = None,
+        tokenizer: Any | None = None,
         min_chunk_tokens: int = MIN_CHUNK_TOKENS,
         device: str | torch.device = "cpu",
         punct_ids: set[int] | None = None,
@@ -187,38 +186,43 @@ class SentenceBoundaryChunkConstructor:
                 "new_position must equal current sequence length (chunk_map.shape[0])."
             )
 
+        normalized_chunks = [
+            chunk.to(device=self.device, dtype=torch.long) for chunk in chunks
+        ]
+        current_map = chunk_map.to(device=self.device, dtype=torch.long)
+
         new_position_tensor = torch.tensor(
             [new_position], dtype=torch.long, device=self.device
         )
         new_chunk_map = torch.cat(
-            [chunk_map, torch.zeros(1, dtype=torch.long, device=self.device)]
+            [current_map, torch.zeros(1, dtype=torch.long, device=self.device)]
         )
 
-        token_is_boundary = new_token_id in self.punct_ids
+        token_is_boundary = int(new_token_id) in self.punct_ids
 
-        if len(chunks) == 0:
-            chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
+        if len(normalized_chunks) == 0:
+            normalized_chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
 
         if token_is_boundary:
-            if chunks[-1].numel() == 0:
-                chunks[-1] = new_position_tensor
+            if normalized_chunks[-1].numel() == 0:
+                normalized_chunks[-1] = new_position_tensor
             else:
-                chunks[-1] = torch.cat([chunks[-1], new_position_tensor])
-            new_chunk_map[new_position] = len(chunks) - 1
-            chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
+                normalized_chunks[-1] = torch.cat([normalized_chunks[-1], new_position_tensor])
+            new_chunk_map[new_position] = len(normalized_chunks) - 1
+            normalized_chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
         else:
-            active_chunk_index = len(chunks) - 1
-            if chunks[-1].numel() == 0:
-                chunks[-1] = new_position_tensor
+            active_chunk_index = len(normalized_chunks) - 1
+            if normalized_chunks[-1].numel() == 0:
+                normalized_chunks[-1] = new_position_tensor
             else:
-                chunks[-1] = torch.cat([chunks[-1], new_position_tensor])
+                normalized_chunks[-1] = torch.cat([normalized_chunks[-1], new_position_tensor])
             new_chunk_map[new_position] = active_chunk_index
 
-        return chunks, new_chunk_map
+        return normalized_chunks, new_chunk_map
 
 
 def build_module1(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: Any,
     device: str | torch.device = "cpu",
     min_chunk_tokens: int = MIN_CHUNK_TOKENS,
 ) -> SentenceBoundaryChunkConstructor:
