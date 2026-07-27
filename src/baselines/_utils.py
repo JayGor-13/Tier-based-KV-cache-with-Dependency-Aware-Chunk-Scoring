@@ -48,6 +48,25 @@ def topk_from_candidates(
     return candidates[top_local]
 
 
+def trim_keep_mask_to_budget(
+    keep_mask: torch.Tensor,
+    scores: torch.Tensor,
+    budget: int,
+) -> torch.Tensor:
+    """Drop the lowest-scored kept tokens until the mask respects budget."""
+    target_keep = max(0, min(int(budget), int(keep_mask.numel())))
+    current_keep = int(keep_mask.sum().item())
+    if current_keep <= target_keep:
+        return keep_mask
+
+    kept_indices = torch.nonzero(keep_mask, as_tuple=False).flatten()
+    local_scores = scores.to(device=keep_mask.device, dtype=torch.float32)[kept_indices]
+    drop_count = current_keep - target_keep
+    drop_local = torch.topk(local_scores, k=drop_count, largest=False).indices
+    keep_mask[kept_indices[drop_local]] = False
+    return keep_mask
+
+
 def build_result_from_keep_mask(
     *,
     keep_mask: torch.Tensor,

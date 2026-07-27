@@ -14,6 +14,8 @@ Follows spec exactly. Issues are marked with # ISSUE comments.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -124,7 +126,7 @@ class DualSignalScorer:
         # ISSUE: A_obs arrives as float16/bfloat16 from the model's attention
         # computation. Keeping it in float16 during the sum operations risks
         # silent overflow for long sequences (t > 4096). Always upcast here.
-        A = A_obs.float()
+        A = A_obs.to(device=self.device, dtype=torch.float32)
 
         # Dispatch based on tensor dimensionality
         if A.dim() == 3:
@@ -178,6 +180,14 @@ class DualSignalScorer:
         R_token : Tensor, shape [t]   — forward routing score per token
         """
         H, w, t = A.shape
+        if H <= 0:
+            raise ValueError("A_obs must contain at least one attention head.")
+        if w <= 0:
+            raise ValueError("A_obs must contain at least one observed query.")
+        if w > t and t > 0:
+            raise ValueError(
+                f"A_obs window axis ({w}) cannot exceed token axis ({t})."
+            )
 
         # -----------------------------------------------------------
         # Signal 1: Attention Mass M[j]
@@ -241,7 +251,8 @@ class DualSignalScorer:
         #   .sum(dim=0):    [w]        (sum over heads h)
         # Result: R_window[q] for q = 0..w-1, maps to global pos t-w+q
 
-        R_window = (A * M_token[None, None, :]).sum(dim=2).sum(dim=0)  # [w]
+        # Keep R on the same head scale as the M fallback used outside the window.
+        R_window = (A * M_token[None, None, :]).sum(dim=2).sum(dim=0) / float(H)  # [w]
 
         # Write window R values back into the full R_token vector
         actual_window_len = window_end - window_start
@@ -267,6 +278,8 @@ class DualSignalScorer:
         R_token : Tensor, shape [t]
         """
         L, H, w, t = A.shape
+        if L <= 0:
+            raise ValueError("A_obs must contain at least one layer.")
 
         # Build or validate layer weights
         if self.layer_weights is not None and self.layer_weights.shape[0] == L:
@@ -286,7 +299,7 @@ class DualSignalScorer:
         for l_idx in range(L):
             A_l = A[l_idx]  # [H, w, t]
             M_l, R_l = self._compute_signals_single_layer(A_l)
-            weight = layer_w[l_idx].item()
+            weight = layer_w[l_idx]
             M_accum += weight * M_l
             R_accum += weight * R_l
 
@@ -321,7 +334,8 @@ class DualSignalScorer:
         chunk_scores = torch.zeros(M_chunks, dtype=torch.float32, device=self.device)
 
         for k, chunk_indices in enumerate(chunks):
-            if chunk_indices.numel() == 0:
+            chunk_idx = self._as_index_tensor(chunk_indices)
+            if chunk_idx.numel() == 0:
                 # ISSUE: Empty chunk guard (can occur from Module 1's trailing
                 # placeholder after a boundary token at end of generation step).
                 # Assign 0.0 so the chunk gets lowest priority — it will be
@@ -330,7 +344,7 @@ class DualSignalScorer:
                 continue
 
             # Gather token scores for this chunk and mean-pool
-            chunk_token_scores = token_scores[chunk_indices]
+            chunk_token_scores = token_scores[chunk_idx]
             chunk_scores[k] = chunk_token_scores.mean()
 
         return chunk_scores
@@ -374,6 +388,18 @@ class DualSignalScorer:
         if len(chunks) == 0:
             raise ValueError("chunks list is empty — Module 1 produced no chunks.")
 
+        for chunk in chunks:
+            idx = self._as_index_tensor(chunk)
+            if idx.numel() == 0:
+                continue
+            min_idx = int(idx.min().item())
+            max_idx = int(idx.max().item())
+            if min_idx < 0 or max_idx >= t:
+                raise IndexError(
+                    f"Chunk token indices out of range: found [{min_idx}, {max_idx}] "
+                    f"for sequence length {t}."
+                )
+
         # ISSUE: We do not verify that chunks form a complete partition of
         # [0, t-1] here because the incremental update path in Module 1
         # can leave the last chunk open (not yet closed by a boundary token).
@@ -382,6 +408,15 @@ class DualSignalScorer:
         #   assert torch.equal(all_indices, torch.arange(t))
         # This is O(t log t) — suitable for testing but not production.
         # See test_scorer.py for the full partition verification.
+
+    def _as_index_tensor(self, chunk_indices: Tensor | Sequence[int]) -> Tensor:
+        if isinstance(chunk_indices, Tensor):
+            idx = chunk_indices.to(device=self.device, dtype=torch.long)
+        else:
+            idx = torch.as_tensor(chunk_indices, dtype=torch.long, device=self.device)
+        if idx.ndim != 1:
+            raise ValueError("Each chunk must be a 1D tensor/array of token indices.")
+        return idx
 
     # ------------------------------------------------------------------
     # Incremental score update during generation
@@ -429,23 +464,36 @@ class DualSignalScorer:
         M[j] for any token j propagates to R[i] for all i that attend to j.
         We bound this by only updating window tokens' R scores.
         """
+        if prev_Score_chunk.ndim != 1:
+            raise ValueError("prev_Score_chunk must be a 1D tensor of shape [M].")
+
         # Recompute full signal vectors with new A_obs
-        A = A_obs_new.float()
+        A = A_obs_new.to(device=self.device, dtype=torch.float32)
         if A.dim() == 3:
             M_token, R_token = self._compute_signals_single_layer(A)
-        else:
+        elif A.dim() == 4:
             M_token, R_token = self._compute_signals_multi_layer(A)
+        else:
+            raise ValueError(
+                f"A_obs_new must be 3D [H,w,t] or 4D [L,H,w,t], got shape {A_obs_new.shape}"
+            )
 
         M_chunks = len(chunks)
+        self._validate_chunks(chunks, M_token.shape[0])
         S1_new = self._aggregate_to_chunks(M_token, chunks, M_chunks)
         S2_new = self._aggregate_to_chunks(R_token, chunks, M_chunks)
         S1_hat = self._minmax_normalize(S1_new)
         S2_hat = self._minmax_normalize(S2_new)
 
         # Build updated score vector, writing only affected positions
-        Score_chunk = prev_Score_chunk.clone()
+        Score_chunk = torch.zeros(M_chunks, dtype=torch.float32, device=self.device)
+        prev_scores = prev_Score_chunk.to(device=self.device, dtype=torch.float32)
+        copy_len = min(int(prev_scores.numel()), M_chunks)
+        if copy_len > 0:
+            Score_chunk[:copy_len] = prev_scores[:copy_len]
+
         for k in updated_chunk_indices:
-            if k < M_chunks:
+            if 0 <= k < M_chunks:
                 Score_chunk[k] = self.alpha * S1_hat[k] + self.beta * S2_hat[k]
 
         return Score_chunk

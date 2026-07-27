@@ -206,6 +206,53 @@ class TestDualSignalScorer(unittest.TestCase):
 
         self.assertTrue(torch.equal(updated_scores, prev_scores))
 
+    def test_update_scores_ignores_negative_chunk_indices(self) -> None:
+        h, w, t = 2, 4, 20
+        chunks = _uniform_chunks(t, chunk_size=5)
+        scorer = build_module2(window_size=w, device="cpu")
+
+        a_obs_old = _make_attention(h, w, t, seed=31)
+        prev_scores = scorer.forward(a_obs_old, chunks)
+
+        a_obs_new = _make_attention(h, w, t, seed=32)
+        updated_scores = scorer.update_scores(
+            prev_Score_chunk=prev_scores,
+            A_obs_new=a_obs_new,
+            chunks=chunks,
+            updated_chunk_indices=[-1],
+        )
+
+        self.assertTrue(torch.equal(updated_scores, prev_scores))
+
+    def test_update_scores_extends_when_chunk_count_grows(self) -> None:
+        h, w, t = 2, 4, 21
+        old_chunks = _uniform_chunks(20, chunk_size=5)
+        new_chunks = old_chunks + [torch.tensor([20], dtype=torch.long)]
+        scorer = build_module2(window_size=w, device="cpu")
+
+        prev_scores = torch.full((len(old_chunks),), 0.25, dtype=torch.float32)
+        a_obs_new = _make_attention(h, w, t, seed=41)
+        updated_scores = scorer.update_scores(
+            prev_Score_chunk=prev_scores,
+            A_obs_new=a_obs_new,
+            chunks=new_chunks,
+            updated_chunk_indices=[len(new_chunks) - 1],
+        )
+
+        self.assertEqual(tuple(updated_scores.shape), (len(new_chunks),))
+        self.assertTrue(torch.equal(updated_scores[:-1], prev_scores))
+        self.assertFalse(torch.isnan(updated_scores).any().item())
+
+    def test_forward_rejects_negative_chunk_indices(self) -> None:
+        h, w, t = 2, 4, 10
+        a_obs = _make_attention(h, w, t, seed=51)
+        chunks = [torch.tensor([0, 1], dtype=torch.long), torch.tensor([-1], dtype=torch.long)]
+
+        scorer = build_module2(window_size=w, device="cpu")
+
+        with self.assertRaises(IndexError):
+            _ = scorer.forward(a_obs, chunks)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -5,7 +5,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from src.baselines._utils import build_result_from_keep_mask, forced_keep_mask, topk_from_candidates
+from src.baselines._utils import (
+    build_result_from_keep_mask,
+    forced_keep_mask,
+    topk_from_candidates,
+    trim_keep_mask_to_budget,
+)
 from src.core.evictor import EvictionResult
 
 
@@ -109,6 +114,8 @@ def evict_snapkv(
         candidate_mask = ~keep_mask
         dynamic_keep = topk_from_candidates(scores, candidate_mask, remaining)
         keep_mask[dynamic_keep] = True
+
+    keep_mask = trim_keep_mask_to_budget(keep_mask, scores, budget)
 
     return build_result_from_keep_mask(
         keep_mask=keep_mask, k_cache=k_cache, v_cache=v_cache, budget=budget
