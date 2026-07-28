@@ -1,0 +1,461 @@
+{
+  "created_at": "2026-07-28T04:51:21.523151+00:00",
+  "models": [
+    "Qwen/Qwen2.5-0.5B-Instruct"
+  ],
+  "datasets": [
+    {
+      "name": "gsm8k",
+      "source": "gsm8k",
+      "split": "test",
+      "config": "main",
+      "prompt_field": "question",
+      "answer_field": "answer",
+      "id_field": null,
+      "prompt_template": null
+    }
+  ],
+  "grid": {
+    "budgets": [],
+    "budget_ratios": [
+      0.5
+    ],
+    "thetas": [
+      0.3
+    ],
+    "recent_windows": [
+      16
+    ],
+    "alphas": [
+      0.6
+    ],
+    "max_samples": 10,
+    "max_length": 2048,
+    "max_new_tokens": 50,
+    "attention_mode": "last",
+    "layer_index": -1,
+    "min_chunk_tokens": 5,
+    "allow_level2_fallback": false
+  },
+  "summary": {
+    "total_runs": 10,
+    "successful_runs": 10,
+    "failed_runs": 0,
+    "cache_summary": {
+      "count": 10,
+      "avg_retention_ratio": 0.6679822867980763,
+      "avg_compression_ratio": 0.33201771320192375,
+      "avg_budget_gap": 6.2,
+      "avg_latency_ms": 4.65245998930186,
+      "p50_latency_ms": 2.1102000027894974,
+      "p90_latency_ms": 2.5363999884575605
+    },
+    "qa_summary": {
+      "count": 20,
+      "exact_match": 0.0,
+      "f1": 0.24768530498624938
+    }
+  },
+  "runs": [
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_0",
+      "config": {
+        "budget": 32,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 65,
+      "num_chunks": 4,
+      "tier_counts": {
+        "tier0": 1,
+        "tier1": 0,
+        "tier2": 3
+      },
+      "kept_tokens": 45,
+      "removed_tokens": 20,
+      "score_min": 0.0,
+      "score_max": 0.8025007247924805,
+      "metrics": {
+        "sample_id": "gsm8k_0",
+        "original_length": 65,
+        "budget": 32,
+        "kept_length": 45,
+        "removed_length": 20,
+        "retention_ratio": 0.6923076923076923,
+        "compression_ratio": 0.3076923076923077,
+        "budget_gap": 13,
+        "latency_ms": 27.857700013555586
+      },
+      "prediction": "To determine how much money Janet makes every day from selling the eggs, we need to follow these steps:\n\n1. Calculate the total number of eggs laid by the ducks each day.\n2. Determine the revenue from selling the eggs.\n\nFirst, let's",
+      "evicted_prediction": "To determine how much Janet makes at the farmers' market every day, we need to follow these steps:\n\n1. Calculate the total number of eggs laid by the ducks in a day.\n2. Determine how many eggs are sold at the farmers' market",
+      "gold": "Janet sells 16 - 3 - 4 = <<16-3-4=9>>9 duck eggs a day.\nShe makes 9 * 2 = $<<9*2=18>>18 every day at the farmer\u2019s market.\n#### 18"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_1",
+      "config": {
+        "budget": 13,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 26,
+      "num_chunks": 2,
+      "tier_counts": {
+        "tier0": 0,
+        "tier1": 0,
+        "tier2": 2
+      },
+      "kept_tokens": 26,
+      "removed_tokens": 0,
+      "score_min": 0.4000000059604645,
+      "score_max": 0.6000000238418579,
+      "metrics": {
+        "sample_id": "gsm8k_1",
+        "original_length": 26,
+        "budget": 13,
+        "kept_length": 26,
+        "removed_length": 0,
+        "retention_ratio": 1.0,
+        "compression_ratio": 0.0,
+        "budget_gap": 13,
+        "latency_ms": 1.648699981160462
+      },
+      "prediction": "To determine the total number of bolts needed, we need to calculate the amount of each type of fiber required for one robe and then sum these amounts.\n\n1. **Blue Fiber:**\n   - The problem states that it takes 2 bolts of blue",
+      "evicted_prediction": "To determine the total number of bolts needed, we need to calculate the number of bolts required for both the blue and white fibers separately and then sum them up.\n\n1. **Blue Fiber:**\n   - It takes 2 bolts of blue fiber.",
+      "gold": "It takes 2/2=<<2/2=1>>1 bolt of white fiber\nSo the total amount of fabric is 2+1=<<2+1=3>>3 bolts of fabric\n#### 3"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_2",
+      "config": {
+        "budget": 28,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 57,
+      "num_chunks": 5,
+      "tier_counts": {
+        "tier0": 3,
+        "tier1": 0,
+        "tier2": 2
+      },
+      "kept_tokens": 30,
+      "removed_tokens": 27,
+      "score_min": 0.0,
+      "score_max": 1.0,
+      "metrics": {
+        "sample_id": "gsm8k_2",
+        "original_length": 57,
+        "budget": 28,
+        "kept_length": 30,
+        "removed_length": 27,
+        "retention_ratio": 0.5263157894736842,
+        "compression_ratio": 0.4736842105263158,
+        "budget_gap": 2,
+        "latency_ms": 2.0199998980388045
+      },
+      "prediction": "To determine the profit that Jack made from his house purchase, we need to follow these steps:\n\n1. **Calculate the total cost of the house:**\n   The house costs $80,000.\n\n2. **Determine the increase",
+      "evicted_prediction": "To determine the profit that Josh made, we need to follow these steps:\n\n1. **Define the initial value of the house:**\n   Let the initial value of the house be \\( V \\).\n\n2. **Calculate the new value of the house",
+      "gold": "The cost of the house and repairs came out to 80,000+50,000=$<<80000+50000=130000>>130,000\nHe increased the value of the house by 80,000*1.5=<<80000*1.5=120000>>120,000\nSo the new value of the house is 120,000+80,000=$<<120000+80000=200000>>200,000\nSo he made a profit of 200,000-130,000=$<<200000-130000=70000>>70,000\n#### 70000"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_3",
+      "config": {
+        "budget": 18,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 35,
+      "num_chunks": 3,
+      "tier_counts": {
+        "tier0": 0,
+        "tier1": 0,
+        "tier2": 3
+      },
+      "kept_tokens": 35,
+      "removed_tokens": 0,
+      "score_min": 0.3942996859550476,
+      "score_max": 0.6000000238418579,
+      "metrics": {
+        "sample_id": "gsm8k_3",
+        "original_length": 35,
+        "budget": 18,
+        "kept_length": 35,
+        "removed_length": 0,
+        "retention_ratio": 1.0,
+        "compression_ratio": 0.0,
+        "budget_gap": 17,
+        "latency_ms": 2.0964000141248107
+      },
+      "prediction": "To determine the total number of meters James runs in a week, we need to follow these steps:\n\n1. Calculate the distance James runs in one sprint.\n2. Multiply that distance by the number of sprints he runs per week.\n\nFirst, let",
+      "evicted_prediction": "To determine the total number of meters James runs in a week, we need to follow these steps:\n\n1. Calculate the distance James runs in one sprint.\n2. Multiply the distance of one sprint by the number of sprints he runs in a week",
+      "gold": "He sprints 3*3=<<3*3=9>>9 times\nSo he runs 9*60=<<9*60=540>>540 meters\n#### 540"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_4",
+      "config": {
+        "budget": 56,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 111,
+      "num_chunks": 7,
+      "tier_counts": {
+        "tier0": 5,
+        "tier1": 0,
+        "tier2": 2
+      },
+      "kept_tokens": 51,
+      "removed_tokens": 60,
+      "score_min": 0.0,
+      "score_max": 1.0,
+      "metrics": {
+        "sample_id": "gsm8k_4",
+        "original_length": 111,
+        "budget": 56,
+        "kept_length": 51,
+        "removed_length": 60,
+        "retention_ratio": 0.4594594594594595,
+        "compression_ratio": 0.5405405405405406,
+        "budget_gap": -5,
+        "latency_ms": 2.394799957983196
+      },
+      "prediction": "To determine how many cups of feed Wendi needs for the final meal of the day, we can follow these steps:\n\n1. Calculate the total amount of feed given to all the chickens in a day.\n2. Determine how much feed is needed per",
+      "evicted_prediction": "To determine how many cups of mixed chicken feed Wendi needs to give her chickens in the final meal of the day, we need to follow these steps:\n\n1. Calculate the total number of cups of feed needed for all the chickens.\n2. Determine",
+      "gold": "If each chicken eats 3 cups of feed per day, then for 20 chickens they would need 3*20=<<3*20=60>>60 cups of feed per day.\nIf she feeds the flock 15 cups of feed in the morning, and 25 cups in the afternoon, then the final meal would require 60-15-25=<<60-15-25=20>>20 cups of chicken feed.\n#### 20"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_5",
+      "config": {
+        "budget": 28,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 56,
+      "num_chunks": 5,
+      "tier_counts": {
+        "tier0": 2,
+        "tier1": 0,
+        "tier2": 3
+      },
+      "kept_tokens": 36,
+      "removed_tokens": 20,
+      "score_min": 0.010956190526485443,
+      "score_max": 0.7530049085617065,
+      "metrics": {
+        "sample_id": "gsm8k_5",
+        "original_length": 56,
+        "budget": 28,
+        "kept_length": 36,
+        "removed_length": 20,
+        "retention_ratio": 0.6428571428571429,
+        "compression_ratio": 0.3571428571428571,
+        "budget_gap": 8,
+        "latency_ms": 2.1843999857082963
+      },
+      "prediction": "To determine how much Kylar needs to pay for 16 glasses, we first need to calculate the cost of one specific glass and then multiply that by 16.\n\nThe cost of one glass is given as $5. Every second glass",
+      "evicted_prediction": "To determine how much Kylar needs to pay for 16 glasses, we need to follow these steps:\n\n1. Identify the cost of one glass.\n2. Multiply the cost of one glass by the number of glasses Kylar wants to",
+      "gold": "The discount price of one glass is 60/100 * 5 = $<<60/100*5=3>>3.\nIf every second glass is cheaper, that means Kylar is going to buy 16 / 2 = <<16/2=8>>8 cheaper glasses.\nSo for the cheaper glasses, Kylar is going to pay 8 * 3 = $<<8*3=24>>24.\nAnd for the regular-priced glasses, Kylar will pay 8 * 5 = $<<8*5=40>>40.\nSo in total Kylar needs to pay 24 + 40 = $<<24+40=64>>64 for the glasses he wants to buy.\n#### 64"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_6",
+      "config": {
+        "budget": 21,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 42,
+      "num_chunks": 4,
+      "tier_counts": {
+        "tier0": 1,
+        "tier1": 0,
+        "tier2": 3
+      },
+      "kept_tokens": 31,
+      "removed_tokens": 11,
+      "score_min": 0.0008536126115359366,
+      "score_max": 0.8854608535766602,
+      "metrics": {
+        "sample_id": "gsm8k_6",
+        "original_length": 42,
+        "budget": 21,
+        "kept_length": 31,
+        "removed_length": 11,
+        "retention_ratio": 0.7380952380952381,
+        "compression_ratio": 0.26190476190476186,
+        "budget_gap": 10,
+        "latency_ms": 1.8269000574946404
+      },
+      "prediction": "To determine the total number of sheep that Toulouse, Charleston, and Seattle have together, we need to follow these steps:\n\n1. Identify the number of sheep in each city.\n2. Sum the number of sheep from all three cities.\n\nFirst,",
+      "evicted_prediction": "To determine the total number of sheep that Toulouse, Charleston, and Seattle have together, we start by identifying the number of sheep each person has based on the given information.\n\n1. We know that Seattle has 20 sheep.\n2. T",
+      "gold": "If Seattle has 20 sheep, Charleston has 4 * 20 sheep = <<20*4=80>>80 sheep\nToulouse has twice as many sheep as Charleston, which is 2 * 80 sheep = <<2*80=160>>160 sheep\nTogether, the three has 20 sheep + 160 sheep + 80 sheep = <<20+160+80=260>>260 sheep\n#### 260"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_7",
+      "config": {
+        "budget": 35,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 70,
+      "num_chunks": 7,
+      "tier_counts": {
+        "tier0": 4,
+        "tier1": 0,
+        "tier2": 3
+      },
+      "kept_tokens": 33,
+      "removed_tokens": 37,
+      "score_min": 0.0,
+      "score_max": 0.8103551864624023,
+      "metrics": {
+        "sample_id": "gsm8k_7",
+        "original_length": 70,
+        "budget": 35,
+        "kept_length": 33,
+        "removed_length": 37,
+        "retention_ratio": 0.4714285714285714,
+        "compression_ratio": 0.5285714285714286,
+        "budget_gap": -2,
+        "latency_ms": 2.123999991454184
+      },
+      "prediction": "To determine how long it takes for Carla to complete her download, we need to break down the problem into manageable parts and calculate the time step by step.\n\n1. **Calculate the remaining download time before the restart:**\n   The total size of the",
+      "evicted_prediction": "To determine the total load Carla needs to download the 200 GB file, we need to consider the process of downloading the file step by step.\n\n1. **Initial Download:**\n   Carla starts with a 200 GB file.",
+      "gold": "First find how many gigabytes are in 40% of the file: 200 GB * 40% = <<200*40*.01=80>>80 GB\nThen divide that number by the download rate to find the time until Windows restarts: 80 GB / 2 GB/minute = <<80/2=40>>40 minutes\nThen find the time to download the whole file after the restart: 200 GB / 2 GB/minute = <<200/2=100>>100 minutes\nThen add the time to download 40% of the file, to download the whole file, and to wait for Windows to update: 40 minutes + 100 minutes + 20 minutes = <<40+100+20=160>>160 minutes\n#### 160"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_8",
+      "config": {
+        "budget": 52,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 104,
+      "num_chunks": 5,
+      "tier_counts": {
+        "tier0": 3,
+        "tier1": 0,
+        "tier2": 2
+      },
+      "kept_tokens": 45,
+      "removed_tokens": 59,
+      "score_min": 0.0,
+      "score_max": 1.0,
+      "metrics": {
+        "sample_id": "gsm8k_8",
+        "original_length": 104,
+        "budget": 52,
+        "kept_length": 45,
+        "removed_length": 59,
+        "retention_ratio": 0.4326923076923077,
+        "compression_ratio": 0.5673076923076923,
+        "budget_gap": -7,
+        "latency_ms": 2.5363999884575605
+      },
+      "prediction": "To determine how far John is from his home at the end of the 4-hour trip, we need to calculate the total distance he travels and subtract it from his starting point.\n\nFirst, let's break down the journey into segments:\n\n1. **",
+      "evicted_prediction": "To determine how far John is from home at the end of the 4-hour journey, we need to calculate the total distance he travels and then subtract the distance he covers while turning around.\n\nFirst, let's calculate the distance John travels in the first",
+      "gold": "When he turned around he was 3*60=<<3*60=180>>180 miles from home\nHe was only able to drive 4-2=<<4-2=2>>2 hours in the first four hours\nIn half an hour he goes 30*.5=<<30*.5=15>>15 miles\nHe then drives another 2-.5=<<2-.5=1.5>>1.5 hours\nIn that time he goes 80*1.5=<<80*1.5=120>>120 miles\nSo he drove 120+15=<<120+15=135>>135 miles\nSo he is 180-135=<<180-135=45>>45 miles away from home\n#### 45"
+    },
+    {
+      "status": "ok",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "dataset": "gsm8k",
+      "sample_id": "gsm8k_9",
+      "config": {
+        "budget": 30,
+        "theta": 0.3,
+        "recent_window": 16,
+        "alpha": 0.6,
+        "beta": 0.4,
+        "attention_mode": "last",
+        "layer_index": -1
+      },
+      "sequence_length": 60,
+      "num_chunks": 5,
+      "tier_counts": {
+        "tier0": 2,
+        "tier1": 0,
+        "tier2": 3
+      },
+      "kept_tokens": 43,
+      "removed_tokens": 17,
+      "score_min": 0.0,
+      "score_max": 0.8088545799255371,
+      "metrics": {
+        "sample_id": "gsm8k_9",
+        "original_length": 60,
+        "budget": 30,
+        "kept_length": 43,
+        "removed_length": 17,
+        "retention_ratio": 0.7166666666666667,
+        "compression_ratio": 0.2833333333333333,
+        "budget_gap": 13,
+        "latency_ms": 1.8353000050410628
+      },
+      "prediction": "To determine Eliza's earnings for the week, we need to calculate both her regular pay and her overtime pay separately.\n\nFirst, let's calculate her regular pay for the first 40 hours:\n\\[\n\\text{Regular pay} = \\",
+      "evicted_prediction": "To determine Eliza's earnings for the week, we need to calculate her hourly wage and then multiply it by the number of hours she worked.\n\nFirst, we know that Eliza's hourly wage is $10 per hour. She worked for",
+      "gold": "Eliza is entitled to 45 -40 = <<45-40=5>>5 hours overtime pay.\nHer hourly rate for the overtime pay is $10 x 1.2 = $<<10*1.2=12>>12.\nSo, Eliza will receive $12 x 5 =$<<12*5=60>>60 for overtime pay.\nHer regular weekly earning is $10 x 40 = $<<10*40=400>>400.\nThus, Eliza will receive a total of $400 + $60 = $<<400+60=460>>460 for this week's work.\n#### 460"
+    }
+  ]
+}

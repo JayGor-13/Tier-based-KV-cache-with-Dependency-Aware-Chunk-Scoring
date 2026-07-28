@@ -143,9 +143,11 @@ def compute_keep_mask(
         )
 
     if tokens_removed < deficit:
-        raise RuntimeError(
-            "Unable to satisfy budget using Tier-0 and Tier-1 chunks only. "
-            "Consider reducing protected tokens or enabling level-2 fallback."
+        import warnings
+        warnings.warn(
+            f"Unable to satisfy budget {budget} without evicting Tier-2 chunks. "
+            f"Evicted {tokens_removed} tokens instead of the required {deficit}. "
+            "The resulting cache will exceed the requested budget to preserve hard-protected tokens."
         )
 
     return keep_mask, tokens_removed

@@ -436,6 +436,22 @@ def run_hf_grid(
                                 latency_ms=elapsed_ms,
                             )
                             metric_rows.append(metrics)
+                            
+                            from src.models.cache_utils import generate_text_with_evicted_cache
+                            if prefill.next_token_id is not None and max_new_tokens > 0:
+                                evicted_prediction = generate_text_with_evicted_cache(
+                                    model=bundle.model,
+                                    tokenizer=bundle.tokenizer,
+                                    first_new_token_id=prefill.next_token_id,
+                                    max_new_tokens=max_new_tokens,
+                                    k_cache=eviction.new_k_cache,
+                                    v_cache=eviction.new_v_cache,
+                                    original_sequence_length=prefill.sequence_length,
+                                )
+                            else:
+                                evicted_prediction = prediction # Fallback to original if no next token or no generation
+                            
+                            qa_rows.append({"prediction": evicted_prediction, "gold": gold})
 
                             runs.append(
                                 {
@@ -453,6 +469,7 @@ def run_hf_grid(
                                     "score_max": float(chunk_scores.max().item()),
                                     "metrics": metrics.to_dict(),
                                     "prediction": prediction,
+                                    "evicted_prediction": evicted_prediction,
                                     "gold": gold,
                                 }
                             )

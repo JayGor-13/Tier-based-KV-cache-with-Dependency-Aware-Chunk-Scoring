@@ -36,6 +36,7 @@ class HfPrefillRecord:
     attention_obs: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
+    next_token_id: int | None = None
 
     @property
     def sequence_length(self) -> int:
@@ -195,6 +196,36 @@ def extract_layer_kv_cache(
     return k_cache, v_cache
 
 
+def extract_full_kv_cache(
+    past_key_values: Any,
+    *,
+    offload_to_cpu: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract all layers' KV cache as `[num_layers, batch, heads, seq_len, head_dim]` tensors."""
+    legacy_cache = _legacy_past_key_values(past_key_values)
+    k_layers = []
+    v_layers = []
+    
+    for layer_cache in legacy_cache:
+        if isinstance(layer_cache, dict):
+            key_tensor = layer_cache.get("key_states") or layer_cache.get("key")
+            value_tensor = layer_cache.get("value_states") or layer_cache.get("value")
+        else:
+            key_tensor, value_tensor = layer_cache[:2]
+            
+        k_cache = key_tensor.detach()
+        v_cache = value_tensor.detach()
+        
+        if offload_to_cpu:
+            k_cache = k_cache.cpu()
+            v_cache = v_cache.cpu()
+            
+        k_layers.append(k_cache)
+        v_layers.append(v_cache)
+        
+    return torch.stack(k_layers, dim=0), torch.stack(v_layers, dim=0)
+
+
 def _select_attention_window(
     attention: torch.Tensor,
     *,
@@ -296,11 +327,14 @@ def run_hf_prefill(
         layer_index=layer_index,
         offload_to_cpu=offload_to_cpu,
     )
-    k_cache, v_cache = extract_layer_kv_cache(
+    k_cache, v_cache = extract_full_kv_cache(
         outputs.past_key_values,
-        layer_index=layer_index,
         offload_to_cpu=offload_to_cpu,
     )
+    
+    next_token_id = None
+    if hasattr(outputs, "logits") and outputs.logits is not None:
+        next_token_id = int(torch.argmax(outputs.logits[0, -1, :]).item())
 
     return HfPrefillRecord(
         sample_id=sample_id,
@@ -311,6 +345,7 @@ def run_hf_prefill(
         attention_obs=attention_obs,
         k_cache=k_cache,
         v_cache=v_cache,
+        next_token_id=next_token_id,
     )
 
 
@@ -350,12 +385,94 @@ def generate_text(
     return tokenizer.decode(continuation, skip_special_tokens=True).strip()
 
 
+def generate_text_with_evicted_cache(
+    *,
+    model: Any,
+    tokenizer: Any,
+    first_new_token_id: int,
+    max_new_tokens: int,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    original_sequence_length: int,
+) -> str:
+    """Generate text dynamically using an already evicted KV cache."""
+    if max_new_tokens <= 0:
+        return ""
+
+    device = model_device(model)
+    from transformers.cache_utils import DynamicCache
+    
+    # HF models with RoPE (like Qwen2) often do: cos, sin = rotary_emb(..., seq_len=kv_seq_len)
+    # and then rotary_emb returns cos[:kv_seq_len].
+    # But for evicted caches, position_ids can be larger than kv_seq_len,
+    # causing an IndexError when apply_rotary_pos_emb does cos[position_ids].
+    # We patch all rotary embedding modules to use the maximum needed sequence length.
+    original_forwards = {}
+    for name, module in model.named_modules():
+        if "RotaryEmbedding" in module.__class__.__name__:
+            original_forwards[name] = module.forward
+            def make_patched_forward(orig_forward):
+                def patched_forward(self, x, seq_len=None, **kwargs):
+                    # Force seq_len to be large enough for our position_ids
+                    # We add max_new_tokens to ensure it's large enough for the whole generation
+                    target_seq_len = original_sequence_length + max_new_tokens
+                    if seq_len is not None and seq_len < target_seq_len:
+                        seq_len = target_seq_len
+                    # orig_forward is a bound method, so don't pass self
+                    return orig_forward(x, seq_len=seq_len, **kwargs)
+                return patched_forward
+            module.forward = make_patched_forward(module.forward).__get__(module, module.__class__)
+
+    try:
+        past_key_values = DynamicCache()
+        num_layers = k_cache.shape[0]
+        for i in range(num_layers):
+            past_key_values.update(k_cache[i].to(device), v_cache[i].to(device), layer_idx=i)
+
+        input_ids = torch.tensor([[first_new_token_id]], dtype=torch.long, device=device)
+        cache_len = k_cache.shape[-2]
+        attention_mask = torch.ones(1, cache_len + 1, dtype=torch.long, device=device)
+        position_ids = torch.tensor([[original_sequence_length]], dtype=torch.long, device=device)
+
+        generated_tokens = [first_new_token_id]
+        
+        # We already generated the first token from the prefill step, so we need max_new_tokens - 1 more
+        for _ in range(max_new_tokens - 1):
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            generated_tokens.append(next_token.item())
+            
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+                
+            input_ids = next_token
+            attention_mask = torch.cat([attention_mask, torch.ones(1, 1, dtype=torch.long, device=device)], dim=1)
+            position_ids = position_ids + 1
+            past_key_values = outputs.past_key_values
+
+        return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    finally:
+        for name, orig_forward in original_forwards.items():
+            module = dict(model.named_modules())[name]
+            module.forward = orig_forward.__get__(module, module.__class__)
+
+
 __all__ = [
     "HfModelBundle",
     "HfPrefillRecord",
     "extract_attention_obs",
     "extract_layer_kv_cache",
     "generate_text",
+    "generate_text_with_evicted_cache",
     "load_hf_model_and_tokenizer",
     "model_device",
     "resolve_device",

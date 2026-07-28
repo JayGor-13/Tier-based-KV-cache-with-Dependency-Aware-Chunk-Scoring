@@ -209,7 +209,8 @@ class SentenceBoundaryChunkConstructor:
             else:
                 normalized_chunks[-1] = torch.cat([normalized_chunks[-1], new_position_tensor])
             new_chunk_map[new_position] = len(normalized_chunks) - 1
-            normalized_chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
+            if normalized_chunks[-1].numel() >= self.min_chunk_tokens:
+                normalized_chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
         else:
             active_chunk_index = len(normalized_chunks) - 1
             if normalized_chunks[-1].numel() == 0:
