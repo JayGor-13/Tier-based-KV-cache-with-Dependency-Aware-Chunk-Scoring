@@ -1,7 +1,8 @@
-torch>=2.1.0
-transformers==4.43.0
-datasets
-accelerate
-pytest
-numpy
-scipy
+torch>=2.13.0
+transformers>=5.14.1
+datasets>=5.0.1
+accelerate>=1.14.0
+numpy>=2.5.1
+scipy>=1.18.0
+matplotlib>=3.11.1
+pytest>=9.1.1

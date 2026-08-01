@@ -106,17 +106,31 @@ def load_hf_model_and_tokenizer(
 
     model_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
     if torch_dtype is not None:
-        model_kwargs["torch_dtype"] = torch_dtype
+        model_kwargs["dtype"] = torch_dtype
     if attn_implementation:
         model_kwargs["attn_implementation"] = attn_implementation
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-    except TypeError:
-        if "attn_implementation" not in model_kwargs:
-            raise
-        model_kwargs.pop("attn_implementation")
-        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    load_attempts = [dict(model_kwargs)]
+    if "dtype" in model_kwargs:
+        legacy_dtype_kwargs = dict(model_kwargs)
+        legacy_dtype_kwargs["torch_dtype"] = legacy_dtype_kwargs.pop("dtype")
+        load_attempts.append(legacy_dtype_kwargs)
+    if attn_implementation:
+        for candidate in list(load_attempts):
+            without_attn = dict(candidate)
+            without_attn.pop("attn_implementation", None)
+            load_attempts.append(without_attn)
+
+    last_type_error: TypeError | None = None
+    for kwargs in load_attempts:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+            break
+        except TypeError as exc:
+            last_type_error = exc
+    else:
+        assert last_type_error is not None
+        raise last_type_error
 
     model.to(device_obj)
     model.eval()
@@ -208,10 +222,17 @@ def extract_full_kv_cache(
     
     for layer_cache in legacy_cache:
         if isinstance(layer_cache, dict):
-            key_tensor = layer_cache.get("key_states") or layer_cache.get("key")
-            value_tensor = layer_cache.get("value_states") or layer_cache.get("value")
+            key_tensor = layer_cache.get("key_states")
+            if key_tensor is None:
+                key_tensor = layer_cache.get("key")
+            value_tensor = layer_cache.get("value_states")
+            if value_tensor is None:
+                value_tensor = layer_cache.get("value")
         else:
             key_tensor, value_tensor = layer_cache[:2]
+
+        if key_tensor is None or value_tensor is None:
+            raise ValueError("Unable to extract key/value tensors from model cache.")
             
         k_cache = key_tensor.detach()
         v_cache = value_tensor.detach()

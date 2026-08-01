@@ -22,7 +22,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--methods",
         type=str,
-        default="chunkkv,snapkv,h2o",
+        default="streamingllm,chunkkv,snapkv,h2o",
         help="Comma-separated baseline methods.",
     )
     parser.add_argument(

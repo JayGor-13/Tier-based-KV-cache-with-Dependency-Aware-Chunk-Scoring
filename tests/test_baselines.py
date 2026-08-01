@@ -2,6 +2,8 @@ import torch
 
 from src.baselines.h2o import evict_h2o
 from src.baselines.snapkv import evict_snapkv
+from src.baselines.streamingllm import evict_streamingllm
+from benchmarks.pipeline import TraceSample, run_baseline_policy
 
 
 def _cache(seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,3 +50,42 @@ def test_snapkv_trims_forced_sink_tokens_to_budget():
     assert int(result.kept_indices.numel()) == budget
     assert result.new_k_cache.shape[-2] == budget
     assert result.new_v_cache.shape[-2] == budget
+
+
+def test_streamingllm_keeps_sink_and_recent_tokens():
+    seq_len = 8
+    budget = 4
+    k_cache, v_cache = _cache(seq_len)
+
+    result = evict_streamingllm(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        budget=budget,
+        num_sink_tokens=2,
+    )
+
+    assert result.kept_indices.tolist() == [0, 1, 6, 7]
+    assert result.new_k_cache.shape[-2] == budget
+    assert result.new_v_cache.shape[-2] == budget
+
+
+def test_pipeline_runs_streamingllm_baseline():
+    seq_len = 8
+    budget = 4
+    k_cache, v_cache = _cache(seq_len)
+    sample = TraceSample(
+        sample_id="streaming_sample",
+        chunks=[torch.arange(0, 4), torch.arange(4, 8)],
+        chunk_scores=torch.tensor([0.1, 0.9]),
+        k_cache=k_cache,
+        v_cache=v_cache,
+    )
+
+    result, metrics = run_baseline_policy(
+        sample,
+        method="streamingllm",
+        budget=budget,
+    )
+
+    assert int(result.kept_indices.numel()) == budget
+    assert metrics.kept_length == budget
