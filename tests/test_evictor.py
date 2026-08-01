@@ -54,14 +54,14 @@ def test_evict_kv_cache_uses_level1_when_level0_insufficient():
     assert result.new_v_cache.shape[-2] == len(kept)
 
 
-def test_evict_kv_cache_raises_when_only_tier2_exists():
+def test_evict_kv_cache_preserves_tier2_when_budget_is_too_strict():
     chunks, scores = _build_inputs()
     tiers = torch.tensor([2, 2, 2, 2, 2], dtype=torch.int8)
     k_cache = torch.randn(2, 10, 8)
     v_cache = torch.randn(2, 10, 8)
 
-    with pytest.raises(RuntimeError):
-        evict_kv_cache(
+    with pytest.warns(UserWarning, match="Unable to satisfy budget"):
+        result = evict_kv_cache(
             mask_tiers=tiers,
             chunk_scores=scores,
             chunks=chunks,
@@ -69,3 +69,7 @@ def test_evict_kv_cache_raises_when_only_tier2_exists():
             v_cache=v_cache,
             budget=6,
         )
+
+    assert result.kept_indices.tolist() == list(range(10))
+    assert result.removed_indices.tolist() == []
+    assert result.tokens_removed == 0

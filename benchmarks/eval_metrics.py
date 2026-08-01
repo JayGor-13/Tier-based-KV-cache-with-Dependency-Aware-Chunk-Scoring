@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import statistics
 from dataclasses import asdict, dataclass
+from math import isfinite
 from typing import Iterable
 
 
@@ -17,6 +18,7 @@ class CacheMetrics:
     removed_length: int
     retention_ratio: float
     compression_ratio: float
+    compression_multiplier: float
     budget_gap: int
     latency_ms: float
 
@@ -35,6 +37,7 @@ def compute_cache_metrics(
     removed = max(original_length - kept_length, 0)
     retention = (kept_length / float(original_length)) if original_length > 0 else 1.0
     compression = 1.0 - retention
+    multiplier = (float(original_length) / kept_length) if kept_length > 0 else float("inf")
     gap = kept_length - budget
     return CacheMetrics(
         sample_id=sample_id,
@@ -44,6 +47,7 @@ def compute_cache_metrics(
         removed_length=removed,
         retention_ratio=retention,
         compression_ratio=compression,
+        compression_multiplier=multiplier,
         budget_gap=gap,
         latency_ms=float(latency_ms),
     )
@@ -63,6 +67,7 @@ def summarize_cache_metrics(metrics: list[CacheMetrics]) -> dict:
             "count": 0,
             "avg_retention_ratio": 0.0,
             "avg_compression_ratio": 0.0,
+            "avg_compression_multiplier": 0.0,
             "avg_budget_gap": 0.0,
             "avg_latency_ms": 0.0,
             "p50_latency_ms": 0.0,
@@ -75,10 +80,17 @@ def summarize_cache_metrics(metrics: list[CacheMetrics]) -> dict:
     p90_idx = int(0.9 * (len(sorted_lat) - 1))
     p90 = sorted_lat[p90_idx]
 
+    multipliers = [
+        m.compression_multiplier
+        for m in metrics
+        if isfinite(m.compression_multiplier)
+    ]
+
     return {
         "count": len(metrics),
         "avg_retention_ratio": _mean(m.retention_ratio for m in metrics),
         "avg_compression_ratio": _mean(m.compression_ratio for m in metrics),
+        "avg_compression_multiplier": _mean(multipliers) if multipliers else float("inf"),
         "avg_budget_gap": _mean(float(m.budget_gap) for m in metrics),
         "avg_latency_ms": _mean(latencies),
         "p50_latency_ms": float(p50),

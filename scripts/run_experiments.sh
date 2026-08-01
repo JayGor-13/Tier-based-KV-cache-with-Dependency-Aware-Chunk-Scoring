@@ -8,8 +8,8 @@ MODELS="Qwen/Qwen2.5-0.5B-Instruct"
 # Evaluate on GSM8K (reasoning) and HotpotQA (multi-hop)
 DATASETS="source=gsm8k,config=main,split=test,prompt_field=question,answer_field=answer;source=hotpot_qa,config=distractor,split=validation,prompt_field=question,answer_field=answer"
 
-# Compression ratios (e.g. 0.2 means keep 20%, evict 80%)
-BUDGET_RATIOS="0.2,0.4,0.6,0.8"
+# Compression ratios (Standard MBE Ladders: 50%, 25%, 12.5%, 6.25%)
+BUDGET_RATIOS="0.5,0.25,0.125,0.0625"
 
 # TDC-KV Parameters
 THETAS="0.2,0.3,0.4"

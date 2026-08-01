@@ -1,12 +1,12 @@
 # TDC-KV Repo Context
 
-Last maintained: 2026-07-27
+Last maintained: 2026-07-30
 
 ## Purpose
 
 This repository implements a trace-driven prototype of tier-based KV-cache
 eviction with dependency-aware chunk scoring. The design details live in
-`specifications.md`; `README.md` currently only contains the project title.
+`specifications.md`; common setup and smoke commands live in `README.md`.
 
 ## Implemented Pipeline
 
@@ -36,8 +36,9 @@ eviction with dependency-aware chunk scoring. The design details live in
 5. Benchmarks and baselines
    - `benchmarks/pipeline.py` runs TDC-KV and baseline policies from precomputed
      trace records.
-   - `scripts/run_main_results.py`, `scripts/run_baselines.py`, and
-     `scripts/run_ablations.py` are the main trace-driven entry points.
+   - `scripts/run_main_results.py`, `scripts/run_baselines.py`,
+     `scripts/run_ablations.py`, and `scripts/run_hf_grid.py` are the main
+     experiment entry points.
    - Baselines implemented: ChunkKV, SnapKV, and H2O-style observed-attention
      heavy hitters.
 
@@ -61,33 +62,37 @@ eviction with dependency-aware chunk scoring. The design details live in
   `compute_keep_mask` calls.
 - H2O and SnapKV baselines now trim lowest-scored forced keeps when sink/recent
   protections exceed the requested budget, preserving the budget invariant.
+- HuggingFace cache extraction avoids boolean checks on tensors, which can
+  raise in PyTorch.
+- `transformers` model loading now prefers the current `dtype` keyword and
+  falls back to legacy `torch_dtype` for older installs.
+- Generated `tmp/` and `outputs/` artifacts were removed from version control
+  and are now ignored. The smoke trace was moved to `data/sample_trace.jsonl`.
 
 ## Verification
 
 Commands run successfully:
 
 ```powershell
-python -m pytest -q
-python scripts\run_main_results.py --trace-path tmp\sample_trace.jsonl --recent-window 4 --output tmp\codex_main_check.json
-python scripts\run_baselines.py --trace-path tmp\sample_trace.jsonl --recent-window 4 --output tmp\codex_baselines_check.json
-python scripts\run_ablations.py --trace-path tmp\sample_trace.jsonl --theta-grid 0.3 --recent-window-grid 4 --output tmp\codex_ablations_check.json
+python -m pytest
+python scripts\run_main_results.py --trace-path data\sample_trace.jsonl --recent-window 4 --output outputs\codex_main_check.json
+python scripts\run_baselines.py --trace-path data\sample_trace.jsonl --recent-window 4 --output outputs\codex_baselines_check.json
+python scripts\run_ablations.py --trace-path data\sample_trace.jsonl --theta-grid 0.3 --recent-window-grid 4 --output outputs\codex_ablations_check.json
 python -c "import src.core; import src.baselines; print('imports ok')"
 ```
 
-Temporary `tmp/codex_*_check.json` files from verification were removed after
-the smoke checks.
+Temporary `outputs/codex_*_check.json` files from verification can be removed
+after smoke checks.
 
 ## Known Problems and Deferred Improvements
 
-- `src/models/cache_utils.py`, `src/models/modeling_llama.py`, and
-  `src/models/modeling_phi3.py` are empty. A live transformer integration is
-  not implemented in this repo yet.
-- `setup.py` and `requirements.txt` are empty. `environment.yml` contains the
-  currently necessary runtime/test dependencies for the implemented trace path.
-- The main TDC-KV method can fail if hard-protected Tier 2 tokens alone exceed
-  the budget. This is consistent with the current hard-protection methodology;
-  changing it would require an explicit policy choice, such as reducing the
-  recent window or enabling Level-2 fallback.
+- Live HuggingFace generation with an evicted cache is implemented, but remains
+  model-sensitive because RoPE/cache behavior differs across model families and
+  `transformers` releases.
+- The main TDC-KV method can exceed a requested budget if hard-protected Tier 2
+  tokens alone exceed the budget. This is consistent with the current
+  hard-protection methodology; changing it would require an explicit policy
+  choice, such as reducing the recent window or enabling Level-2 fallback.
 - Whole-chunk eviction can undershoot or overshoot the exact budget because it
   removes entire chunks. This follows the current chunk-level eviction design.
 - Module 1 incremental updates do not apply the `min_chunk_tokens` merge rule

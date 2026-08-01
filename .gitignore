@@ -15,6 +15,11 @@ ENV/
 .coverage.*
 htmlcov/
 
+# Generated experiment artifacts
+outputs/
+tmp/
+figures/
+
 # Type checker / linter caches
 .mypy_cache/
 .ruff_cache/

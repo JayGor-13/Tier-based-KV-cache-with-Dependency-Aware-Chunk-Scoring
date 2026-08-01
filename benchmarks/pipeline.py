@@ -14,6 +14,7 @@ from benchmarks.eval_metrics import CacheMetrics, compute_cache_metrics
 from src.baselines.chunkkv import evict_chunkkv
 from src.baselines.h2o import evict_h2o
 from src.baselines.snapkv import evict_snapkv
+from src.baselines.streamingllm import evict_streamingllm
 from src.core.evictor import EvictionResult, evict_kv_cache
 from src.core.masker import assign_protection_tiers, infer_sequence_length
 
@@ -211,7 +212,14 @@ def run_baseline_policy(
     heavy_hitter_ratio: float = 0.7,
 ) -> tuple[EvictionResult, CacheMetrics]:
     method = method.lower()
-    if method == "chunkkv":
+    if method == "streamingllm":
+        result = evict_streamingllm(
+            k_cache=sample.k_cache,
+            v_cache=sample.v_cache,
+            budget=budget,
+            num_sink_tokens=1,
+        )
+    elif method == "chunkkv":
         result = evict_chunkkv(
             chunk_scores=sample.chunk_scores,
             chunks=sample.chunks,

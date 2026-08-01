@@ -20,6 +20,15 @@ def parse_args():
     parser.add_argument("--thetas", type=str, default="0.3", help="Comma-separated list of theta values")
     parser.add_argument("--recent-windows", type=str, default="16", help="Comma-separated list of recent windows")
     parser.add_argument("--alphas", type=str, default="0.6", help="Comma-separated list of alpha values")
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="tdc_kv",
+        help=(
+            "Comma-separated methods: fullkv,streamingllm,h2o,snapkv,"
+            "chunkkv,tdc_kv"
+        ),
+    )
     
     parser.add_argument("--max-samples", type=int, default=10, help="Max samples per dataset")
     parser.add_argument("--max-length", type=int, default=2048, help="Max total sequence length")
@@ -42,6 +51,7 @@ def main():
     thetas = [float(t.strip()) for t in args.thetas.split(",") if t.strip()]
     recent_windows = [int(w.strip()) for w in args.recent_windows.split(",") if w.strip()]
     alphas = [float(a.strip()) for a in args.alphas.split(",") if a.strip()]
+    methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     
     print(f"Running grid search for {len(models)} models and {len(datasets)} datasets...")
     
@@ -53,6 +63,7 @@ def main():
         thetas=thetas,
         recent_windows=recent_windows,
         alphas=alphas,
+        methods=methods,
         max_samples=args.max_samples,
         max_length=args.max_length,
         max_new_tokens=args.max_new_tokens,

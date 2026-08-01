@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import Sequence
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 

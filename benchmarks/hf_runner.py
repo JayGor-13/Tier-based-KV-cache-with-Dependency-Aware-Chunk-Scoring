@@ -18,15 +18,30 @@ from benchmarks.eval_metrics import (
     summarize_cache_metrics,
     summarize_qa,
 )
+from src.baselines.chunkkv import evict_chunkkv
+from src.baselines.h2o import evict_h2o
+from src.baselines.snapkv import evict_snapkv
+from src.baselines.streamingllm import evict_streamingllm
 from src.core.chunker import SentenceBoundaryChunkConstructor
-from src.core.evictor import evict_kv_cache
+from src.core.evictor import EvictionResult, evict_kv_cache
 from src.core.masker import assign_protection_tiers
 from src.core.scorer import DualSignalScorer
 from src.models.cache_utils import (
+    generate_text_with_evicted_cache,
     generate_text,
     load_hf_model_and_tokenizer,
     run_hf_prefill,
 )
+
+
+SUPPORTED_METHODS = {
+    "fullkv",
+    "streamingllm",
+    "h2o",
+    "snapkv",
+    "chunkkv",
+    "tdc_kv",
+}
 
 
 @dataclass(frozen=True)
@@ -234,6 +249,146 @@ def _tier_counts(tiers: torch.Tensor) -> dict[str, int]:
     }
 
 
+def normalize_methods(methods: Iterable[str] | None) -> list[str]:
+    """Normalize and validate experiment method names."""
+    if methods is None:
+        return ["tdc_kv"]
+
+    aliases = {
+        "tdc-kv": "tdc_kv",
+        "tdckv": "tdc_kv",
+        "full": "fullkv",
+        "full_kv": "fullkv",
+        "streaming": "streamingllm",
+        "streaming_llm": "streamingllm",
+        "skv": "snapkv",
+    }
+    normalized: list[str] = []
+    for raw in methods:
+        method = aliases.get(raw.strip().lower(), raw.strip().lower())
+        if not method:
+            continue
+        if method not in SUPPORTED_METHODS:
+            supported = ", ".join(sorted(SUPPORTED_METHODS))
+            raise ValueError(f"Unsupported method `{raw}`. Supported methods: {supported}.")
+        if method not in normalized:
+            normalized.append(method)
+
+    if not normalized:
+        raise ValueError("At least one method is required.")
+    return normalized
+
+
+def _baseline_attention(attention_obs: torch.Tensor) -> torch.Tensor:
+    """Return a 3D attention tensor for token-level baselines."""
+    if attention_obs.ndim == 3:
+        return attention_obs
+    if attention_obs.ndim == 4:
+        return attention_obs[-1]
+    raise ValueError(
+        f"Expected attention shape [H,w,t] or [L,H,w,t], got {tuple(attention_obs.shape)}."
+    )
+
+
+def _run_eviction_method(
+    method: str,
+    prefill: Any,
+    *,
+    budget: int,
+    theta: float,
+    recent_window: int,
+    chunk_scores: torch.Tensor,
+    attention_obs: torch.Tensor,
+    allow_level2_fallback: bool,
+) -> tuple[EvictionResult, torch.Tensor | None]:
+    """Apply one compressed-cache method to an HF prefill record."""
+    method = normalize_methods([method])[0]
+    if method == "fullkv":
+        raise ValueError("`fullkv` is handled before eviction.")
+
+    if method == "tdc_kv":
+        tiers = assign_protection_tiers(
+            chunk_scores=chunk_scores,
+            chunks=prefill.chunks,
+            theta=float(theta),
+            recent_window=int(recent_window),
+            sequence_length=prefill.sequence_length,
+        )
+        eviction = evict_kv_cache(
+            mask_tiers=tiers,
+            chunk_scores=chunk_scores,
+            chunks=prefill.chunks,
+            k_cache=prefill.k_cache,
+            v_cache=prefill.v_cache,
+            budget=int(budget),
+            allow_level2_fallback=allow_level2_fallback,
+        )
+        return eviction, tiers
+
+    if method == "streamingllm":
+        return (
+            evict_streamingllm(
+                k_cache=prefill.k_cache,
+                v_cache=prefill.v_cache,
+                budget=int(budget),
+            ),
+            None,
+        )
+
+    if method == "chunkkv":
+        return (
+            evict_chunkkv(
+                chunk_scores=chunk_scores,
+                chunks=prefill.chunks,
+                k_cache=prefill.k_cache,
+                v_cache=prefill.v_cache,
+                budget=int(budget),
+                theta=float(theta),
+                recent_window=int(recent_window),
+                sequence_length=prefill.sequence_length,
+            ),
+            None,
+        )
+
+    baseline_attention = _baseline_attention(attention_obs)
+    if method == "snapkv":
+        return (
+            evict_snapkv(
+                attention_obs=baseline_attention,
+                k_cache=prefill.k_cache,
+                v_cache=prefill.v_cache,
+                budget=int(budget),
+                recent_window=int(recent_window),
+            ),
+            None,
+        )
+    if method == "h2o":
+        return (
+            evict_h2o(
+                attention_obs=baseline_attention,
+                k_cache=prefill.k_cache,
+                v_cache=prefill.v_cache,
+                budget=int(budget),
+                recent_window=int(recent_window),
+            ),
+            None,
+        )
+
+    raise ValueError(f"Unsupported method `{method}`.")
+
+
+def _append_method_quality(
+    method_qa_rows: dict[str, list[dict[str, str]]],
+    method: str,
+    prediction: str,
+    gold: str | None,
+) -> None:
+    if gold is not None:
+        method_qa_rows.setdefault(method, []).append(
+            {"prediction": prediction, "gold": gold}
+        )
+
+
 def _error_row(
     *,
     model_name: str,
@@ -262,6 +417,7 @@ def run_hf_grid(
     thetas: list[float],
     recent_windows: list[int],
     alphas: list[float],
+    methods: list[str] | None = None,
     max_samples: int | None = None,
     max_length: int | None = 2048,
     max_new_tokens: int = 0,
@@ -287,6 +443,10 @@ def run_hf_grid(
         raise ValueError("At least one theta value is required.")
     if not alphas:
         raise ValueError("At least one alpha value is required.")
+    experiment_methods = normalize_methods(methods)
+    compressed_methods = [
+        method for method in experiment_methods if method != "fullkv"
+    ]
 
     dataset_records = {
         spec.name: load_dataset_records(spec, max_samples=max_samples)
@@ -295,7 +455,14 @@ def run_hf_grid(
 
     runs: list[dict[str, Any]] = []
     metric_rows: list[CacheMetrics] = []
-    qa_rows: list[dict[str, str]] = []
+    method_metric_rows: dict[str, list[CacheMetrics]] = {
+        method: [] for method in experiment_methods
+    }
+    method_qa_rows: dict[str, list[dict[str, str]]] = {
+        method: [] for method in experiment_methods
+    }
+    baseline_qa_rows: list[dict[str, str]] = []
+    evicted_qa_rows: list[dict[str, str]] = []
     max_observation_window = max(int(window) for window in recent_windows)
 
     for model_name in model_names:
@@ -329,7 +496,7 @@ def run_hf_grid(
                         max_length=max_length,
                     )
                     if prediction and gold is not None:
-                        qa_rows.append({"prediction": prediction, "gold": gold})
+                        baseline_qa_rows.append({"prediction": prediction, "gold": gold})
 
                     prefill = run_hf_prefill(
                         model=bundle.model,
@@ -354,6 +521,47 @@ def run_hf_grid(
                             error=exc,
                         )
                     )
+                    continue
+
+                if "fullkv" in experiment_methods:
+                    full_metrics = compute_cache_metrics(
+                        sample_id=sample_id,
+                        original_length=prefill.sequence_length,
+                        budget=prefill.sequence_length,
+                        kept_length=prefill.sequence_length,
+                        latency_ms=0.0,
+                    )
+                    method_metric_rows["fullkv"].append(full_metrics)
+                    if prediction and gold is not None:
+                        _append_method_quality(
+                            method_qa_rows, "fullkv", prediction, gold
+                        )
+                    runs.append(
+                        {
+                            "status": "ok",
+                            "method": "fullkv",
+                            "model": model_name,
+                            "dataset": spec.name,
+                            "sample_id": sample_id,
+                            "config": {
+                                "method": "fullkv",
+                                "budget": prefill.sequence_length,
+                                "attention_mode": attention_mode,
+                                "layer_index": int(layer_index),
+                            },
+                            "sequence_length": prefill.sequence_length,
+                            "num_chunks": len(prefill.chunks),
+                            "tier_counts": None,
+                            "kept_tokens": prefill.sequence_length,
+                            "removed_tokens": 0,
+                            "metrics": full_metrics.to_dict(),
+                            "prediction": prediction,
+                            "evicted_prediction": prediction,
+                            "gold": gold,
+                        }
+                    )
+
+                if not compressed_methods:
                     continue
 
                 resolved_budgets = resolve_budgets(
@@ -400,97 +608,105 @@ def run_hf_grid(
                         continue
 
                     for budget, theta in product(resolved_budgets, thetas):
-                        config = {
-                            "budget": int(budget),
-                            "theta": float(theta),
-                            "recent_window": int(recent_window),
-                            "alpha": float(alpha),
-                            "beta": 1.0 - float(alpha),
-                            "attention_mode": attention_mode,
-                            "layer_index": int(layer_index),
-                        }
-                        try:
-                            started = time.perf_counter()
-                            tiers = assign_protection_tiers(
-                                chunk_scores=chunk_scores,
-                                chunks=prefill.chunks,
-                                theta=float(theta),
-                                recent_window=int(recent_window),
-                                sequence_length=prefill.sequence_length,
-                            )
-                            eviction = evict_kv_cache(
-                                mask_tiers=tiers,
-                                chunk_scores=chunk_scores,
-                                chunks=prefill.chunks,
-                                k_cache=prefill.k_cache,
-                                v_cache=prefill.v_cache,
-                                budget=int(budget),
-                                allow_level2_fallback=allow_level2_fallback,
-                            )
-                            elapsed_ms = (time.perf_counter() - started) * 1000.0
-                            metrics = compute_cache_metrics(
-                                sample_id=sample_id,
-                                original_length=prefill.sequence_length,
-                                budget=int(budget),
-                                kept_length=int(eviction.kept_indices.numel()),
-                                latency_ms=elapsed_ms,
-                            )
-                            metric_rows.append(metrics)
-                            
-                            from src.models.cache_utils import generate_text_with_evicted_cache
-                            if prefill.next_token_id is not None and max_new_tokens > 0:
-                                evicted_prediction = generate_text_with_evicted_cache(
-                                    model=bundle.model,
-                                    tokenizer=bundle.tokenizer,
-                                    first_new_token_id=prefill.next_token_id,
-                                    max_new_tokens=max_new_tokens,
-                                    k_cache=eviction.new_k_cache,
-                                    v_cache=eviction.new_v_cache,
-                                    original_sequence_length=prefill.sequence_length,
+                        for method in compressed_methods:
+                            config = {
+                                "method": method,
+                                "budget": int(budget),
+                                "theta": float(theta),
+                                "recent_window": int(recent_window),
+                                "alpha": float(alpha),
+                                "beta": 1.0 - float(alpha),
+                                "attention_mode": attention_mode,
+                                "layer_index": int(layer_index),
+                            }
+                            try:
+                                started = time.perf_counter()
+                                eviction, tiers = _run_eviction_method(
+                                    method,
+                                    prefill,
+                                    budget=int(budget),
+                                    theta=float(theta),
+                                    recent_window=int(recent_window),
+                                    chunk_scores=chunk_scores,
+                                    attention_obs=attention_obs,
+                                    allow_level2_fallback=allow_level2_fallback,
                                 )
-                            else:
-                                evicted_prediction = prediction # Fallback to original if no next token or no generation
-                            
-                            qa_rows.append({"prediction": evicted_prediction, "gold": gold})
-
-                            runs.append(
-                                {
-                                    "status": "ok",
-                                    "model": model_name,
-                                    "dataset": spec.name,
-                                    "sample_id": sample_id,
-                                    "config": config,
-                                    "sequence_length": prefill.sequence_length,
-                                    "num_chunks": len(prefill.chunks),
-                                    "tier_counts": _tier_counts(tiers),
-                                    "kept_tokens": int(eviction.kept_indices.numel()),
-                                    "removed_tokens": int(eviction.removed_indices.numel()),
-                                    "score_min": float(chunk_scores.min().item()),
-                                    "score_max": float(chunk_scores.max().item()),
-                                    "metrics": metrics.to_dict(),
-                                    "prediction": prediction,
-                                    "evicted_prediction": evicted_prediction,
-                                    "gold": gold,
-                                }
-                            )
-                        except Exception as exc:
-                            if not continue_on_error:
-                                raise
-                            runs.append(
-                                _error_row(
-                                    model_name=model_name,
-                                    dataset_name=spec.name,
+                                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                                metrics = compute_cache_metrics(
                                     sample_id=sample_id,
-                                    error=exc,
-                                    config=config,
+                                    original_length=prefill.sequence_length,
+                                    budget=int(budget),
+                                    kept_length=int(eviction.kept_indices.numel()),
+                                    latency_ms=elapsed_ms,
                                 )
-                            )
+                                metric_rows.append(metrics)
+                                method_metric_rows[method].append(metrics)
+
+                                if prefill.next_token_id is not None and max_new_tokens > 0:
+                                    evicted_prediction = generate_text_with_evicted_cache(
+                                        model=bundle.model,
+                                        tokenizer=bundle.tokenizer,
+                                        first_new_token_id=prefill.next_token_id,
+                                        max_new_tokens=max_new_tokens,
+                                        k_cache=eviction.new_k_cache,
+                                        v_cache=eviction.new_v_cache,
+                                        original_sequence_length=prefill.sequence_length,
+                                    )
+                                else:
+                                    evicted_prediction = prediction
+
+                                _append_method_quality(
+                                    method_qa_rows, method, evicted_prediction, gold
+                                )
+                                if method == "tdc_kv" and gold is not None:
+                                    evicted_qa_rows.append(
+                                        {"prediction": evicted_prediction, "gold": gold}
+                                    )
+
+                                runs.append(
+                                    {
+                                        "status": "ok",
+                                        "method": method,
+                                        "model": model_name,
+                                        "dataset": spec.name,
+                                        "sample_id": sample_id,
+                                        "config": config,
+                                        "sequence_length": prefill.sequence_length,
+                                        "num_chunks": len(prefill.chunks),
+                                        "tier_counts": (
+                                            _tier_counts(tiers)
+                                            if tiers is not None
+                                            else None
+                                        ),
+                                        "kept_tokens": int(eviction.kept_indices.numel()),
+                                        "removed_tokens": int(eviction.removed_indices.numel()),
+                                        "score_min": float(chunk_scores.min().item()),
+                                        "score_max": float(chunk_scores.max().item()),
+                                        "metrics": metrics.to_dict(),
+                                        "prediction": prediction,
+                                        "evicted_prediction": evicted_prediction,
+                                        "gold": gold,
+                                    }
+                                )
+                            except Exception as exc:
+                                if not continue_on_error:
+                                    raise
+                                runs.append(
+                                    _error_row(
+                                        model_name=model_name,
+                                        dataset_name=spec.name,
+                                        sample_id=sample_id,
+                                        error=exc,
+                                        config=config,
+                                    )
+                                )
 
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "models": model_names,
         "datasets": [spec.to_dict() for spec in dataset_specs],
         "grid": {
+            "methods": experiment_methods,
             "budgets": budgets,
             "budget_ratios": budget_ratios,
             "thetas": thetas,
@@ -509,7 +725,17 @@ def run_hf_grid(
             "successful_runs": sum(1 for row in runs if row["status"] == "ok"),
             "failed_runs": sum(1 for row in runs if row["status"] == "error"),
             "cache_summary": summarize_cache_metrics(metric_rows),
-            "qa_summary": summarize_qa(qa_rows),
+            "baseline_qa_summary": summarize_qa(baseline_qa_rows),
+            "evicted_qa_summary": summarize_qa(evicted_qa_rows),
+            "method_summaries": {
+                method: {
+                    "cache_summary": summarize_cache_metrics(
+                        method_metric_rows.get(method, [])
+                    ),
+                    "qa_summary": summarize_qa(method_qa_rows.get(method, [])),
+                }
+                for method in experiment_methods
+            },
         },
         "runs": runs,
     }
@@ -519,6 +745,7 @@ __all__ = [
     "DatasetSpec",
     "build_prompt_from_record",
     "load_dataset_records",
+    "normalize_methods",
     "parse_dataset_spec",
     "parse_key_value_spec",
     "resolve_budgets",
