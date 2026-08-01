@@ -385,11 +385,13 @@ def _append_method_quality(
     method: str,
     prediction: str,
     gold: str | None,
+    dataset: str | None = None,
 ) -> None:
     if gold is not None:
-        method_qa_rows.setdefault(method, []).append(
-            {"prediction": prediction, "gold": gold}
-        )
+        row = {"prediction": prediction, "gold": gold}
+        if dataset is not None:
+            row["dataset"] = dataset
+        method_qa_rows.setdefault(method, []).append(row)
 
 
 def _error_row(
@@ -499,7 +501,13 @@ def run_hf_grid(
                         max_length=max_length,
                     )
                     if prediction and gold is not None:
-                        baseline_qa_rows.append({"prediction": prediction, "gold": gold})
+                        baseline_qa_rows.append(
+                            {
+                                "prediction": prediction,
+                                "gold": gold,
+                                "dataset": spec.name,
+                            }
+                        )
 
                     prefill = run_hf_prefill(
                         model=bundle.model,
@@ -537,7 +545,7 @@ def run_hf_grid(
                     method_metric_rows["fullkv"].append(full_metrics)
                     if prediction and gold is not None:
                         _append_method_quality(
-                            method_qa_rows, "fullkv", prediction, gold
+                            method_qa_rows, "fullkv", prediction, gold, spec.name
                         )
                     runs.append(
                         {
@@ -659,11 +667,19 @@ def run_hf_grid(
                                     evicted_prediction = prediction
 
                                 _append_method_quality(
-                                    method_qa_rows, method, evicted_prediction, gold
+                                    method_qa_rows,
+                                    method,
+                                    evicted_prediction,
+                                    gold,
+                                    spec.name,
                                 )
                                 if method == "tdc_kv" and gold is not None:
                                     evicted_qa_rows.append(
-                                        {"prediction": evicted_prediction, "gold": gold}
+                                        {
+                                            "prediction": evicted_prediction,
+                                            "gold": gold,
+                                            "dataset": spec.name,
+                                        }
                                     )
 
                                 runs.append(

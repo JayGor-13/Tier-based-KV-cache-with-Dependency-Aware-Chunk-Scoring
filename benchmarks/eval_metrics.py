@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import statistics
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Iterable
 
@@ -135,23 +136,99 @@ def token_f1(prediction: str, gold: str) -> float:
     return 2.0 * precision * recall / (precision + recall)
 
 
+_NUMBER_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+
+
+def extract_final_answer(text: str) -> str:
+    """Extract a final short answer, with GSM8K-style numeric answers in mind."""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+
+    if "####" in text:
+        text = text.rsplit("####", 1)[-1]
+
+    boxed = re.findall(r"\\boxed\{([^{}]+)\}", text)
+    if boxed:
+        text = boxed[-1]
+
+    numbers = _NUMBER_RE.findall(text)
+    if numbers:
+        return numbers[-1].replace(",", "")
+
+    return text.strip().strip(".:;,$ ")
+
+
+def _normalize_final_answer(text: str) -> str:
+    answer = extract_final_answer(text)
+    if not answer:
+        return ""
+
+    compact = answer.replace(",", "").replace("$", "").strip()
+    try:
+        numeric = Decimal(compact)
+    except InvalidOperation:
+        return _normalize_answer(answer)
+
+    normalized = format(numeric.normalize(), "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized
+
+
+def final_answer_exact_match(prediction: str, gold: str) -> float:
+    pred = _normalize_final_answer(prediction)
+    ref = _normalize_final_answer(gold)
+    if not pred or not ref:
+        return 0.0
+    return float(pred == ref)
+
+
+def final_answer_f1(prediction: str, gold: str) -> float:
+    pred = extract_final_answer(prediction)
+    ref = extract_final_answer(gold)
+    if not pred or not ref:
+        return 0.0
+    return token_f1(pred, ref)
+
+
+def _needs_final_answer_score(rec: dict, gold: str) -> bool:
+    dataset = str(rec.get("dataset", "")).lower()
+    return "gsm8k" in dataset or "####" in gold
+
+
 def summarize_qa(predictions: list[dict]) -> dict:
     """Summarize QA metrics for records containing `prediction` and `gold`."""
     if not predictions:
-        return {"count": 0, "exact_match": 0.0, "f1": 0.0}
+        return {
+            "count": 0,
+            "exact_match": 0.0,
+            "f1": 0.0,
+            "final_answer_count": 0,
+            "final_answer_exact_match": 0.0,
+            "final_answer_f1": 0.0,
+        }
 
     em_scores = []
     f1_scores = []
+    final_em_scores = []
+    final_f1_scores = []
     for rec in predictions:
         pred = str(rec.get("prediction", ""))
         gold = str(rec.get("gold", ""))
         em_scores.append(exact_match(pred, gold))
         f1_scores.append(token_f1(pred, gold))
+        if _needs_final_answer_score(rec, gold):
+            final_em_scores.append(final_answer_exact_match(pred, gold))
+            final_f1_scores.append(final_answer_f1(pred, gold))
 
     return {
         "count": len(predictions),
         "exact_match": _mean(em_scores),
         "f1": _mean(f1_scores),
+        "final_answer_count": len(final_em_scores),
+        "final_answer_exact_match": _mean(final_em_scores),
+        "final_answer_f1": _mean(final_f1_scores),
     }
 
 
@@ -159,6 +236,9 @@ __all__ = [
     "CacheMetrics",
     "compute_cache_metrics",
     "exact_match",
+    "extract_final_answer",
+    "final_answer_exact_match",
+    "final_answer_f1",
     "summarize_cache_metrics",
     "summarize_qa",
     "token_f1",
