@@ -421,6 +421,7 @@ def generate_text_with_evicted_cache(
         return ""
 
     device = model_device(model)
+    import inspect
     from transformers.cache_utils import DynamicCache
     
     # HF models with RoPE (like Qwen2) often do: cos, sin = rotary_emb(..., seq_len=kv_seq_len)
@@ -431,18 +432,26 @@ def generate_text_with_evicted_cache(
     original_forwards = {}
     for name, module in model.named_modules():
         if "RotaryEmbedding" in module.__class__.__name__:
-            original_forwards[name] = module.forward
+            original_forward = module.forward
+            if "seq_len" not in inspect.signature(original_forward).parameters:
+                continue
+
+            original_forwards[name] = original_forward
             def make_patched_forward(orig_forward):
-                def patched_forward(self, x, seq_len=None, **kwargs):
+                def patched_forward(self, x, *args, seq_len=None, **kwargs):
                     # Force seq_len to be large enough for our position_ids
                     # We add max_new_tokens to ensure it's large enough for the whole generation
                     target_seq_len = original_sequence_length + max_new_tokens
                     if seq_len is not None and seq_len < target_seq_len:
                         seq_len = target_seq_len
                     # orig_forward is a bound method, so don't pass self
-                    return orig_forward(x, seq_len=seq_len, **kwargs)
+                    if seq_len is None:
+                        return orig_forward(x, *args, **kwargs)
+                    return orig_forward(x, *args, seq_len=seq_len, **kwargs)
                 return patched_forward
-            module.forward = make_patched_forward(module.forward).__get__(module, module.__class__)
+            module.forward = make_patched_forward(original_forward).__get__(
+                module, module.__class__
+            )
 
     try:
         past_key_values = DynamicCache()
@@ -484,7 +493,7 @@ def generate_text_with_evicted_cache(
     finally:
         for name, orig_forward in original_forwards.items():
             module = dict(model.named_modules())[name]
-            module.forward = orig_forward.__get__(module, module.__class__)
+            module.forward = orig_forward
 
 
 __all__ = [

@@ -130,6 +130,9 @@ def load_dataset_records(
     if path.exists():
         records = _load_json_records(path)
     else:
+        dataset_source = {
+            "gsm8k": "openai/gsm8k",
+        }.get(spec.source, spec.source)
         try:
             from datasets import load_dataset
         except ModuleNotFoundError as exc:  # pragma: no cover - depends on env
@@ -140,9 +143,9 @@ def load_dataset_records(
 
         split = spec.split or "validation"
         if spec.config:
-            dataset = load_dataset(spec.source, spec.config, split=split)
+            dataset = load_dataset(dataset_source, spec.config, split=split)
         else:
-            dataset = load_dataset(spec.source, split=split)
+            dataset = load_dataset(dataset_source, split=split)
         records = [dict(row) for row in dataset]
 
     if max_samples is not None:
