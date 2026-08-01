@@ -5,8 +5,9 @@
 set -e
 
 MODELS="Qwen/Qwen2.5-0.5B-Instruct"
-# Evaluate on GSM8K (reasoning) and HotpotQA (multi-hop)
-DATASETS="source=gsm8k,config=main,split=test,prompt_field=question,answer_field=answer;source=hotpot_qa,config=distractor,split=validation,prompt_field=question,answer_field=answer"
+# Evaluate on GSM8K (reasoning), HotpotQA (multi-hop with context), and
+# controlled Needle-in-a-Haystack retrieval. Dataset adapters supply task prompts.
+DATASETS="source=gsm8k;source=hotpot_qa;source=niah,name=niah_8k_d50,context_length=8192,needle_depth=0.5,seed=13"
 
 # Compression ratios (Standard MBE Ladders: 50%, 25%, 12.5%, 6.25%)
 BUDGET_RATIOS="0.5,0.25,0.125,0.0625"
@@ -17,6 +18,7 @@ ALPHAS="0.4,0.6,0.8"
 RECENT_WINDOWS="16,32"
 
 MAX_SAMPLES=100
+MAX_LENGTH=9216
 MAX_NEW_TOKENS=256
 DEVICE="cuda" # Change to 'cpu' if running locally without GPU
 
@@ -26,6 +28,7 @@ echo "=========================================================="
 echo "Models: $MODELS"
 echo "Datasets: $DATASETS"
 echo "Max Samples per Dataset: $MAX_SAMPLES"
+echo "Max Prompt Tokens: $MAX_LENGTH"
 echo "Max New Tokens (for generation): $MAX_NEW_TOKENS"
 echo "=========================================================="
 
@@ -40,6 +43,7 @@ python scripts/run_hf_grid.py \
     --alphas "$ALPHAS" \
     --recent-windows "$RECENT_WINDOWS" \
     --max-samples $MAX_SAMPLES \
+    --max-length $MAX_LENGTH \
     --max-new-tokens $MAX_NEW_TOKENS \
     --device "$DEVICE" \
     --output "outputs/full_tdckv_results.json"

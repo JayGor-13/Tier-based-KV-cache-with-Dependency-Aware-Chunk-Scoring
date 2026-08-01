@@ -26,6 +26,7 @@ class TraceSample:
     chunk_scores: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
+    dependency_scores: torch.Tensor | None = None
     budget: int | None = None
     attention_obs: torch.Tensor | None = None
     gold: str | None = None
@@ -87,6 +88,18 @@ def parse_trace_record(record: dict[str, Any], *, sample_index: int = 0) -> Trac
     if chunk_scores.numel() != len(chunks):
         raise ValueError("`chunk_scores` length must match number of chunks.")
 
+    dependency_scores = None
+    if "dependency_scores" in record:
+        dependency_scores = _to_tensor(
+            record["dependency_scores"], dtype=torch.float32
+        )
+        if dependency_scores.ndim != 1:
+            raise ValueError("`dependency_scores` must be 1D.")
+        if dependency_scores.numel() != len(chunks):
+            raise ValueError(
+                "`dependency_scores` length must match number of chunks."
+            )
+
     if "k_cache" in record:
         k_cache = _to_tensor(record["k_cache"], dtype=torch.float32)
     else:
@@ -120,6 +133,7 @@ def parse_trace_record(record: dict[str, Any], *, sample_index: int = 0) -> Trac
         sample_id=str(record.get("id", f"sample_{sample_index}")),
         chunks=chunks,
         chunk_scores=chunk_scores,
+        dependency_scores=dependency_scores,
         k_cache=k_cache,
         v_cache=v_cache,
         budget=record.get("budget"),
@@ -181,6 +195,7 @@ def run_tdc_policy(
         theta=theta,
         recent_window=recent_window,
         sequence_length=sample.sequence_length,
+        protection_scores=sample.dependency_scores,
     )
     t0 = time.perf_counter()
     result = evict_kv_cache(

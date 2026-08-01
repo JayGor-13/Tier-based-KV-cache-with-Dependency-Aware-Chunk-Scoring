@@ -6,18 +6,32 @@ window attention matrix, aggregates them to chunk level, normalizes, and
 fuses into a single Score_chunk vector.
 
 Signal 1 (M): Attention Mass  — how much do recent queries attend TO token j?
-Signal 2 (R): Forward Routing — does token j attend toward high-M tokens?
-              (catches multi-hop bridge tokens that S1 alone would miss)
+Signal 2 (R): Dependency routing — does a historical chunk depend on chunks
+              that are currently important to recent queries?
 
-Follows spec exactly. Issues are marked with # ISSUE comments.
+When a sparse prefill dependency graph is supplied, routing applies to every
+historical chunk. The observation-window-only calculation remains as a
+compatibility path for older traces without dependency edges.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Sequence
 
 import torch
 from torch import Tensor
+
+from src.core.dependency_graph import SparseChunkDependencyGraph
+
+
+@dataclass(frozen=True)
+class ScorerResult:
+    """Normalized component scores and their fused eviction score."""
+
+    attention_scores: Tensor
+    dependency_scores: Tensor
+    chunk_scores: Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +112,21 @@ class DualSignalScorer:
         self,
         A_obs: Tensor,
         chunks: list[Tensor],
+        dependency_graph: SparseChunkDependencyGraph | None = None,
     ) -> Tensor:
+        """Return the fused chunk score used for within-tier eviction ranking."""
+        return self.forward_with_details(
+            A_obs,
+            chunks,
+            dependency_graph=dependency_graph,
+        ).chunk_scores
+
+    def forward_with_details(
+        self,
+        A_obs: Tensor,
+        chunks: list[Tensor],
+        dependency_graph: SparseChunkDependencyGraph | None = None,
+    ) -> ScorerResult:
         """
         Compute Score_chunk for all M chunks.
 
@@ -115,11 +143,16 @@ class DualSignalScorer:
             Chunk index lists from Module 1. chunks[k] contains the integer
             token indices belonging to chunk k.
 
+        dependency_graph : SparseChunkDependencyGraph or None
+            Historical chunk-to-chunk attention edges collected during prefill.
+            Supplying the graph enables an independent routing signal for old
+            chunks; omitting it uses the legacy observation-window fallback.
+
         Returns
         -------
-        Score_chunk : Tensor, shape [M], dtype=float32
-            Combined normalized importance score per chunk.
-            Score_chunk[k] = alpha * S1_hat[k] + beta * S2_hat[k]
+        ScorerResult
+            Normalized attention and dependency component scores plus the fused
+            score ``alpha * S1_hat + beta * S2_hat`` used by the evictor.
         """
         # Upcast to float32 for numerical stability during scoring
         # ISSUE: A_obs arrives as float16/bfloat16 from the model's attention
@@ -148,9 +181,20 @@ class DualSignalScorer:
         # We guard by skipping empty chunks and assigning them score 0.0.
         self._validate_chunks(chunks, t)
 
-        # Aggregate token-level signals to chunk level
+        # Aggregate token-level signals to chunk level.
         S1 = self._aggregate_to_chunks(M_token, chunks, M_chunks)  # shape [M]
-        S2 = self._aggregate_to_chunks(R_token, chunks, M_chunks)  # shape [M]
+        if dependency_graph is None:
+            # Compatibility path for traces that do not yet contain historical
+            # dependency edges. This does not provide an independent routing
+            # signal for tokens outside the observation window.
+            S2 = self._aggregate_to_chunks(R_token, chunks, M_chunks)  # shape [M]
+        else:
+            if dependency_graph.num_chunks != M_chunks:
+                raise ValueError(
+                    "dependency_graph chunk count must match the chunks list."
+                )
+            direct_relevance = self._minmax_normalize(S1)
+            S2 = dependency_graph.to(self.device).route(direct_relevance)
 
         # Min-max normalize both signals to [0, 1]
         S1_hat = self._minmax_normalize(S1)
@@ -159,7 +203,11 @@ class DualSignalScorer:
         # Fuse signals
         Score_chunk = self.alpha * S1_hat + self.beta * S2_hat
 
-        return Score_chunk
+        return ScorerResult(
+            attention_scores=S1_hat,
+            dependency_scores=S2_hat,
+            chunk_scores=Score_chunk,
+        )
 
     # ------------------------------------------------------------------
     # Signal computation — single layer
