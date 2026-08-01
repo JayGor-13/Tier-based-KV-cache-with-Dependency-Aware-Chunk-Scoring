@@ -21,6 +21,24 @@ def parse_args():
     parser.add_argument("--recent-windows", type=str, default="16", help="Comma-separated list of recent windows")
     parser.add_argument("--alphas", type=str, default="0.6", help="Comma-separated list of alpha values")
     parser.add_argument(
+        "--dependency-top-k",
+        type=int,
+        default=8,
+        help="Maximum outgoing dependency edges retained per chunk",
+    )
+    parser.add_argument(
+        "--prefill-block-size",
+        type=int,
+        default=128,
+        help="Queries processed per bounded-attention prefill block",
+    )
+    parser.add_argument(
+        "--tier1-score-mode",
+        choices=("dependency", "fused", "none"),
+        default="dependency",
+        help="Signal used for Tier-1 assignment; `none` disables Tier 1",
+    )
+    parser.add_argument(
         "--methods",
         type=str,
         default="tdc_kv",
@@ -63,6 +81,9 @@ def main():
         thetas=thetas,
         recent_windows=recent_windows,
         alphas=alphas,
+        dependency_top_k=args.dependency_top_k,
+        prefill_block_size=args.prefill_block_size,
+        tier1_score_mode=args.tier1_score_mode,
         methods=methods,
         max_samples=args.max_samples,
         max_length=args.max_length,

@@ -17,13 +17,14 @@ eviction with dependency-aware chunk scoring. The design details live in
 
 2. Module 2, `src/core/scorer.py`
    - Computes attention-mass signal `M` from observed attention `[H,w,t]`.
-   - Computes forward-routing signal `R` for the observed query window.
+   - Routes current relevance through a sparse historical chunk-dependency graph.
+   - Exposes direct-attention, dependency-routing, and fused chunk scores.
    - Aggregates token scores to chunks, min-max normalizes, and fuses with
      `alpha=0.6`, `beta=0.4`.
    - Also supports multi-layer attention `[L,H,w,t]` with optional layer weights.
 
 3. Module 3, `src/core/masker.py`
-   - Assigns chunk tiers: `0` eviction candidate, `1` soft-protected,
+   - Assigns dependency-ranked chunk tiers: `0` eviction candidate, `1` soft-protected,
      `2` hard-protected.
    - Hard-protects the sink chunk and the recent-window chunk range.
 
@@ -32,6 +33,10 @@ eviction with dependency-aware chunk scoring. The design details live in
    - Never removes Tier 2 unless `allow_level2_fallback=True`.
    - Selects cache positions along sequence axis `-2`, so both `[H,t,d]` and
      batched cache layouts are supported.
+   - `src/models/cache_manager.py` keeps logical positions and chunk metadata
+     aligned with the compacted cache and re-evicts after every decode step.
+   - Decode-time trimming guarantees the post-step cache does not exceed the
+     configured budget, using logged Tier-2 fallback only when unavoidable.
 
 5. Benchmarks and baselines
    - `benchmarks/pipeline.py` runs TDC-KV and baseline policies from precomputed
@@ -86,15 +91,20 @@ after smoke checks.
 
 ## Known Problems and Deferred Improvements
 
-- Live HuggingFace generation with an evicted cache is implemented, but remains
-  model-sensitive because RoPE/cache behavior differs across model families and
-  `transformers` releases.
-- The main TDC-KV method can exceed a requested budget if hard-protected Tier 2
-  tokens alone exceed the budget. This is consistent with the current
-  hard-protection methodology; changing it would require an explicit policy
-  choice, such as reducing the recent window or enabling Level-2 fallback.
-- Whole-chunk eviction can undershoot or overshoot the exact budget because it
-  removes entire chunks. This follows the current chunk-level eviction design.
+- Live HuggingFace generation with an evicted cache has offline end-to-end
+  coverage for tiny GPT-2, Llama, and Qwen2 models, including compressed-logit
+  parity and global cache positions. Large checkpoints and additional
+  `transformers` releases still require smoke validation because cache APIs are
+  model- and version-sensitive.
+- The prefill evictor can report an over-budget Tier-2-protected result. Before
+  generation, the decoding cache manager applies a logged Tier-2 fallback and
+  enforces the strict budget; both pre-manager and effective sizes are logged.
+- Whole-chunk eviction can undershoot the exact budget because it removes
+  complete chunks. Decode-time cache size nevertheless remains at or below it.
+- HuggingFace prefill processes bounded query blocks with a cumulative KV cache.
+  Each block is consumed online into the sparse graph and final observation
+  window, so dense attention retention is bounded by the configured block size.
+  The full prompt KV cache is still required before eviction.
 - Module 1 incremental updates do not apply the `min_chunk_tokens` merge rule
   on every append. Aligning incremental and full chunk construction would need a
   deliberate state-management decision.

@@ -229,6 +229,7 @@ Parameters:
 | budget ratio | 0.5, 0.25, 0.125, 0.0625 | 0.25 |
 | layer mode | last layer, all layers uniform, all layers weighted | last/all depending final choice |
 | `allow_level2_fallback` | false, true | false |
+| Tier-1 score mode | dependency, fused, none | dependency |
 
 Report as:
 
@@ -383,11 +384,22 @@ python scripts\run_hf_grid.py `
   --alphas "0.6" `
   --max-samples 200 `
   --max-length 8192 `
+  --prefill-block-size 128 `
   --max-new-tokens 64 `
   --device auto `
   --dtype auto `
   --output outputs\hf_grid_main.json
 ```
+
+The prefill block size controls the attention-memory/forward-call tradeoff and
+must be held fixed within each reported comparison. Log both its configured
+value and the actual block count; use 64 or 128 for Colab smoke runs, then profile
+128 and 256 on the final hardware before fixing the paper configuration.
+
+Every HF output includes `grouped_results`. Use these rows as the source for
+tables and plots because they preserve the requested ratio/absolute budget while
+also reporting the distribution of per-sample resolved token budgets. Raw `runs`
+remain the source for paired significance tests and failure inspection.
 
 NIAH may need a local JSON/JSONL generator rather than a HuggingFace dataset spec.
 
@@ -502,7 +514,7 @@ Run:
 | Variant | Change |
 |---|---|
 | Full TDC-KV | no change |
-| No Tier 1 | `theta=0` |
+| No Tier 1 | `--tier1-score-mode none` (equivalent to `theta=0`) |
 | No sink Tier 2 | do not hard-protect sink chunk |
 | No recent Tier 2 | recent window = 0 |
 | Tier fallback | `allow_level2_fallback=True` |
@@ -666,4 +678,3 @@ Best comparison framing:
 - Compared with SnapKV/H2O, TDC-KV avoids isolated token pruning by preserving complete chunks.
 - Compared with PyramidKV, TDC-KV is not primarily a layer-budget method, but can incorporate layer-weighted scoring.
 - Compared with KVpop, TDC-KV is training-free and simpler, while KVpop is a learned future-attention method.
-

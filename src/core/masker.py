@@ -6,6 +6,7 @@ This module converts continuous chunk scores into discrete protection tiers:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -22,6 +23,7 @@ class MaskerResult:
     threshold: float
     sink_chunk_index: int
     recent_start_chunk_index: int
+    tier1_source: str = "chunk_scores"
 
 
 def _to_index_tensor(chunk: Chunk, device: torch.device | None = None) -> torch.Tensor:
@@ -66,6 +68,7 @@ def assign_protection_tiers(
     recent_window: int = 16,
     sequence_length: int | None = None,
     sink_token_index: int = 0,
+    protection_scores: torch.Tensor | None = None,
     return_details: bool = False,
 ) -> torch.Tensor | MaskerResult:
     """Assign tier mask Pi from chunk scores and chunk definitions.
@@ -77,6 +80,9 @@ def assign_protection_tiers(
         recent_window: Number of most-recent tokens hard-protected (Tier 2).
         sequence_length: Optional explicit sequence length `t`.
         sink_token_index: Token index used as attention sink (usually 0).
+        protection_scores: Optional independent scores used only for Tier 1.
+            TDC-KV supplies dependency-routing scores here while retaining the
+            fused ``chunk_scores`` for within-tier eviction ordering.
         return_details: Return `MaskerResult` instead of only the tiers tensor.
 
     Returns:
@@ -91,6 +97,15 @@ def assign_protection_tiers(
         )
     if recent_window < 0:
         raise ValueError("`recent_window` must be non-negative.")
+    if not 0.0 <= float(theta) <= 1.0:
+        raise ValueError("`theta` must be between 0.0 and 1.0.")
+    if protection_scores is not None:
+        if protection_scores.ndim != 1:
+            raise ValueError("`protection_scores` must be a 1D tensor.")
+        if protection_scores.numel() != chunk_scores.numel():
+            raise ValueError(
+                "`protection_scores` length must match `chunk_scores`."
+            )
 
     if sequence_length is None:
         sequence_length = infer_sequence_length(chunks)
@@ -98,15 +113,6 @@ def assign_protection_tiers(
         raise ValueError("`sequence_length` must be non-negative.")
 
     tiers = torch.zeros_like(chunk_scores, dtype=torch.int8)
-
-    threshold = float("inf")
-    if chunk_scores.numel() > 0 and theta > 0:
-        q = float(max(0.0, min(1.0, 1.0 - theta)))
-        clean_scores = torch.nan_to_num(
-            chunk_scores.to(torch.float32), nan=-1e9, neginf=-1e9, posinf=1e9
-        )
-        threshold = float(torch.quantile(clean_scores, q).item())
-        tiers[clean_scores >= threshold] = 1
 
     sink_chunk_index = find_chunk_index(chunks, sink_token_index)
     if sink_chunk_index >= 0:
@@ -119,12 +125,46 @@ def assign_protection_tiers(
         if recent_start_chunk_index >= 0:
             tiers[recent_start_chunk_index:] = 2
 
+    threshold = float("inf")
+    if chunk_scores.numel() > 0 and theta > 0:
+        tier1_scores = (
+            protection_scores if protection_scores is not None else chunk_scores
+        )
+        clean_scores = torch.nan_to_num(
+            tier1_scores.to(device=chunk_scores.device, dtype=torch.float32),
+            nan=-1e9,
+            neginf=-1e9,
+            posinf=1e9,
+        )
+        eligible = torch.nonzero(tiers != 2, as_tuple=False).flatten()
+        protect_count = min(
+            int(eligible.numel()),
+            int(math.ceil(float(theta) * float(eligible.numel()))),
+        )
+        if protect_count > 0:
+            eligible_scores = clean_scores[eligible]
+            order = torch.argsort(
+                eligible_scores, descending=True, stable=True
+            )
+            protected = eligible[order[:protect_count]]
+            tiers[protected] = 1
+            threshold = float(clean_scores[protected].min().item())
+
     if return_details:
         return MaskerResult(
             tiers=tiers,
             threshold=threshold,
             sink_chunk_index=sink_chunk_index,
             recent_start_chunk_index=recent_start_chunk_index,
+            tier1_source=(
+                "disabled"
+                if theta <= 0
+                else (
+                    "dependency_scores"
+                    if protection_scores is not None
+                    else "chunk_scores"
+                )
+            ),
         )
     return tiers
 
