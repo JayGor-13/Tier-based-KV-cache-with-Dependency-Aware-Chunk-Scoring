@@ -30,6 +30,11 @@ pip install -r requirements.txt
 pip install -e ".[dev]"
 ```
 
+On Colab, keep the runtime-provided PyTorch build. The text-only pipeline does
+not require `torchvision` or `torchaudio`; remove those optional wheels if their
+CUDA build differs from PyTorch. The bundled quickstart performs this cleanup
+before importing Transformers.
+
 With conda:
 
 ```bash

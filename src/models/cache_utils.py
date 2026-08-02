@@ -21,6 +21,7 @@ from src.core.dependency_graph import (
     aggregate_attention_rows,
 )
 from src.models.cache_manager import DecodingCacheManager
+from src.models.hf_cache_adapter import build_dynamic_cache, cache_layer_tensors
 
 
 @dataclass
@@ -164,16 +165,6 @@ def model_device(model: Any) -> torch.device:
         return torch.device("cpu")
 
 
-def _legacy_past_key_values(past_key_values: Any) -> Sequence[Any]:
-    if past_key_values is None:
-        raise ValueError("Model output did not include `past_key_values`.")
-    if hasattr(past_key_values, "to_legacy_cache"):
-        past_key_values = past_key_values.to_legacy_cache()
-    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
-        return list(zip(past_key_values.key_cache, past_key_values.value_cache))
-    return past_key_values
-
-
 def _normalize_layer_index(layer_index: int, num_layers: int) -> int:
     idx = int(layer_index)
     if idx < 0:
@@ -203,23 +194,10 @@ def extract_layer_kv_cache(
     offload_to_cpu: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract one layer's KV cache as `[heads, seq_len, head_dim]` tensors."""
-    legacy_cache = _legacy_past_key_values(past_key_values)
-    layer_count = len(legacy_cache)
+    cache_layers = cache_layer_tensors(past_key_values)
+    layer_count = len(cache_layers)
     idx = _normalize_layer_index(layer_index, layer_count)
-    layer_cache = legacy_cache[idx]
-
-    if isinstance(layer_cache, dict):
-        key_tensor = layer_cache.get("key_states")
-        if key_tensor is None:
-            key_tensor = layer_cache.get("key")
-        value_tensor = layer_cache.get("value_states")
-        if value_tensor is None:
-            value_tensor = layer_cache.get("value")
-    else:
-        key_tensor, value_tensor = layer_cache[:2]
-
-    if key_tensor is None or value_tensor is None:
-        raise ValueError("Unable to extract key/value tensors from model cache.")
+    key_tensor, value_tensor = cache_layers[idx]
 
     k_cache = _select_batch_zero(key_tensor.detach())
     v_cache = _select_batch_zero(value_tensor.detach())
@@ -235,24 +213,11 @@ def extract_full_kv_cache(
     offload_to_cpu: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract all layers' KV cache as `[num_layers, batch, heads, seq_len, head_dim]` tensors."""
-    legacy_cache = _legacy_past_key_values(past_key_values)
+    cache_layers = cache_layer_tensors(past_key_values)
     k_layers = []
     v_layers = []
     
-    for layer_cache in legacy_cache:
-        if isinstance(layer_cache, dict):
-            key_tensor = layer_cache.get("key_states")
-            if key_tensor is None:
-                key_tensor = layer_cache.get("key")
-            value_tensor = layer_cache.get("value_states")
-            if value_tensor is None:
-                value_tensor = layer_cache.get("value")
-        else:
-            key_tensor, value_tensor = layer_cache[:2]
-
-        if key_tensor is None or value_tensor is None:
-            raise ValueError("Unable to extract key/value tensors from model cache.")
-            
+    for key_tensor, value_tensor in cache_layers:
         k_cache = key_tensor.detach()
         v_cache = value_tensor.detach()
         
@@ -659,8 +624,6 @@ def generate_text_with_evicted_cache(
         return empty_result if return_details else empty_result.text
 
     device = model_device(model)
-    from transformers.cache_utils import DynamicCache
-
     cache_manager = None
     if budget is not None:
         if kept_indices is None:
@@ -683,10 +646,12 @@ def generate_text_with_evicted_cache(
         model,
         required_sequence_length=original_sequence_length + max_new_tokens,
     ):
-        past_key_values = DynamicCache()
-        num_layers = k_cache.shape[0]
-        for i in range(num_layers):
-            past_key_values.update(k_cache[i].to(device), v_cache[i].to(device), layer_idx=i)
+        past_key_values = build_dynamic_cache(
+            [
+                (k_cache[layer_index].to(device), v_cache[layer_index].to(device))
+                for layer_index in range(k_cache.shape[0])
+            ]
+        )
 
         input_ids = torch.tensor([[first_new_token_id]], dtype=torch.long, device=device)
         cache_len = k_cache.shape[-2]

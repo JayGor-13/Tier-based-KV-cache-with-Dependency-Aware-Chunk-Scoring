@@ -155,6 +155,11 @@ independent forward pass, verify logical `cache_position` values for RoPE
 families, and require exact budget occupancy after repeated token-granular
 decode eviction. Whole-chunk prefill eviction may still underfill the budget.
 
+All cache tensor access passes through a shared HuggingFace compatibility
+adapter. It supports legacy tuple caches, v4 cache lists, and v5
+`DynamicCache.layers` while exposing the same ordered key/value layer contract
+to prefill extraction and decode-time compaction.
+
 ### Final Check
 
 Does the data flow perfectly connect?

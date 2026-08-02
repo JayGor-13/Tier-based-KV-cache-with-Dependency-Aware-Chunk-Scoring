@@ -12,6 +12,7 @@ from src.models.cache_utils import (
     generate_text_with_evicted_cache,
     run_hf_prefill,
 )
+from src.models.hf_cache_adapter import build_dynamic_cache
 
 
 class _TokenFixture:
@@ -125,12 +126,12 @@ def _token_granular_eviction(prefill, budget):
 
 
 def _dynamic_cache(k_cache, v_cache):
-    from transformers.cache_utils import DynamicCache
-
-    cache = DynamicCache()
-    for layer_index in range(k_cache.shape[0]):
-        cache.update(k_cache[layer_index], v_cache[layer_index], layer_idx=layer_index)
-    return cache
+    return build_dynamic_cache(
+        [
+            (k_cache[layer_index], v_cache[layer_index])
+            for layer_index in range(k_cache.shape[0])
+        ]
+    )
 
 
 @pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])
