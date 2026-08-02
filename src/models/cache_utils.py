@@ -165,6 +165,34 @@ def model_device(model: Any) -> torch.device:
         return torch.device("cpu")
 
 
+def build_position_kwargs(
+    model: Any,
+    position_ids: torch.Tensor,
+    *,
+    include_cache_position: bool | None = None,
+) -> dict[str, torch.Tensor]:
+    """Build logical-position arguments for supported Transformers versions.
+
+    Transformers 4 model families may expose both ``position_ids`` and
+    ``cache_position``. Transformers 5 Llama/Qwen forwards use
+    ``position_ids`` and no longer expose ``cache_position``. Always preserve
+    the global logical position through ``position_ids`` and provide the
+    legacy cache argument only when it is an explicit forward parameter.
+    """
+    if position_ids.ndim != 2:
+        raise ValueError("position_ids must have shape [batch, sequence].")
+
+    if include_cache_position is None:
+        include_cache_position = (
+            "cache_position" in inspect.signature(model.forward).parameters
+        )
+
+    kwargs = {"position_ids": position_ids}
+    if include_cache_position:
+        kwargs["cache_position"] = position_ids.reshape(-1)
+    return kwargs
+
+
 def _normalize_layer_index(layer_index: int, num_layers: int) -> int:
     idx = int(layer_index)
     if idx < 0:
@@ -400,7 +428,9 @@ def run_hf_prefill(
     observation_blocks: list[torch.Tensor] = []
     past_key_values = None
     next_token_id = None
-    forward_parameters = inspect.signature(model.forward).parameters
+    include_cache_position = (
+        "cache_position" in inspect.signature(model.forward).parameters
+    )
     prefill_blocks = 0
 
     with torch.no_grad():
@@ -409,18 +439,21 @@ def run_hf_prefill(
             position_ids = torch.arange(start, end, dtype=torch.long, device=device)[None, :]
             forward_kwargs: dict[str, Any] = {
                 "input_ids": input_ids[:, start:end],
-                "position_ids": position_ids,
                 "use_cache": True,
                 "output_attentions": True,
                 "return_dict": True,
             }
+            forward_kwargs.update(
+                build_position_kwargs(
+                    model,
+                    position_ids,
+                    include_cache_position=include_cache_position,
+                )
+            )
             if "attention_mask" in encoded:
                 forward_kwargs["attention_mask"] = encoded["attention_mask"][:, :end]
             if past_key_values is not None:
                 forward_kwargs["past_key_values"] = past_key_values
-            if "cache_position" in forward_parameters:
-                forward_kwargs["cache_position"] = position_ids.reshape(-1)
-
             for key, value in encoded.items():
                 if key in {"input_ids", "attention_mask", "position_ids"}:
                     continue
@@ -659,19 +692,25 @@ def generate_text_with_evicted_cache(
         position_ids = torch.tensor([[original_sequence_length]], dtype=torch.long, device=device)
 
         generated_tokens = [first_new_token_id]
-        model_forward_parameters = inspect.signature(model.forward).parameters
-        
+        include_cache_position = (
+            "cache_position" in inspect.signature(model.forward).parameters
+        )
+
         # We already generated the first token from the prefill step, so we need max_new_tokens - 1 more
         for _ in range(max_new_tokens - 1):
             forward_kwargs = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "position_ids": position_ids,
                 "past_key_values": past_key_values,
                 "use_cache": True,
             }
-            if "cache_position" in model_forward_parameters:
-                forward_kwargs["cache_position"] = position_ids.reshape(-1)
+            forward_kwargs.update(
+                build_position_kwargs(
+                    model,
+                    position_ids,
+                    include_cache_position=include_cache_position,
+                )
+            )
             with torch.no_grad():
                 outputs = model(**forward_kwargs)
 
@@ -723,6 +762,7 @@ __all__ = [
     "HfModelBundle",
     "HfPrefillRecord",
     "EvictedGenerationResult",
+    "build_position_kwargs",
     "extended_rotary_position_capacity",
     "extract_attention_obs",
     "extract_layer_kv_cache",

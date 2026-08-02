@@ -1,5 +1,3 @@
-import inspect
-
 import pytest
 import torch
 
@@ -8,6 +6,7 @@ transformers = pytest.importorskip("transformers")
 from src.core.evictor import evict_kv_cache
 from src.models.cache_utils import (
     EvictedGenerationResult,
+    build_position_kwargs,
     extended_rotary_position_capacity,
     generate_text_with_evicted_cache,
     run_hf_prefill,
@@ -148,7 +147,6 @@ def test_compressed_cache_logits_match_independent_forward(family):
     reference_kwargs = {
         "input_ids": input_ids,
         "attention_mask": torch.ones(1, budget + 1, dtype=torch.long),
-        "position_ids": position_ids,
         "past_key_values": _dynamic_cache(
             eviction.new_k_cache,
             eviction.new_v_cache,
@@ -156,8 +154,7 @@ def test_compressed_cache_logits_match_independent_forward(family):
         "use_cache": True,
         "return_dict": True,
     }
-    if "cache_position" in inspect.signature(model.forward).parameters:
-        reference_kwargs["cache_position"] = position_ids.reshape(-1)
+    reference_kwargs.update(build_position_kwargs(model, position_ids))
     with extended_rotary_position_capacity(
         model,
         required_sequence_length=prefill.sequence_length + 2,
@@ -199,17 +196,25 @@ def test_compressed_cache_logits_match_independent_forward(family):
 
 
 @pytest.mark.parametrize("family", ["llama", "qwen2"])
-def test_cache_position_tracks_global_positions_across_prefill_and_decode(family):
+def test_logical_positions_remain_global_across_prefill_and_decode(family):
     model = _model_for_family(family)
-    observed_positions = []
+    observed_position_ids = []
+    observed_cache_positions = []
 
-    def capture_cache_position(_module, _args, kwargs):
-        value = kwargs.get("cache_position")
-        if value is not None:
-            observed_positions.append(value.detach().cpu().tolist())
+    def capture_positions(_module, _args, kwargs):
+        position_ids = kwargs.get("position_ids")
+        if position_ids is not None:
+            observed_position_ids.append(
+                position_ids.detach().cpu().reshape(-1).tolist()
+            )
+        cache_position = kwargs.get("cache_position")
+        if cache_position is not None:
+            observed_cache_positions.append(
+                cache_position.detach().cpu().reshape(-1).tolist()
+            )
 
     hook = model.register_forward_pre_hook(
-        capture_cache_position,
+        capture_positions,
         with_kwargs=True,
     )
     try:
@@ -233,7 +238,15 @@ def test_cache_position_tracks_global_positions_across_prefill_and_decode(family
     finally:
         hook.remove()
 
-    assert observed_positions == [[0, 1, 2], [3, 4, 5], [6, 7], [8]]
+    expected = [[0, 1, 2], [3, 4, 5], [6, 7], [8]]
+    assert observed_position_ids == expected
+    expected_cache_positions = (
+        expected if "cache_position" in build_position_kwargs(
+            model,
+            torch.tensor([[0]], dtype=torch.long),
+        ) else []
+    )
+    assert observed_cache_positions == expected_cache_positions
 
 
 def test_repeated_decode_eviction_maintains_exact_budget():
