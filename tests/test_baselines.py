@@ -1,5 +1,6 @@
 import torch
 
+from src.baselines.chunkkv import evict_chunkkv
 from src.baselines.h2o import evict_h2o
 from src.baselines.snapkv import evict_snapkv
 from src.baselines.streamingllm import evict_streamingllm
@@ -89,3 +90,24 @@ def test_pipeline_runs_streamingllm_baseline():
 
     assert int(result.kept_indices.numel()) == budget
     assert metrics.kept_length == budget
+
+
+def test_chunkkv_refines_variable_chunks_to_exact_token_budget():
+    seq_len = 10
+    budget = 6
+    k_cache, v_cache = _cache(seq_len)
+    chunks = [torch.arange(0, 7), torch.arange(7, 10)]
+
+    result = evict_chunkkv(
+        chunk_scores=torch.tensor([0.9, 0.1]),
+        chunks=chunks,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        budget=budget,
+        sequence_length=seq_len,
+    )
+
+    assert result.kept_indices.numel() == budget
+    assert result.budget_utilization == 1.0
+    assert result.budget_shortfall == 0
+    assert result.partially_evicted_chunks == 1

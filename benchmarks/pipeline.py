@@ -10,7 +10,11 @@ from typing import Any, Sequence
 
 import torch
 
-from benchmarks.eval_metrics import CacheMetrics, compute_cache_metrics
+from benchmarks.eval_metrics import (
+    CacheMetrics,
+    compute_cache_metrics,
+    validate_budget_contract,
+)
 from src.baselines.chunkkv import evict_chunkkv
 from src.baselines.h2o import evict_h2o
 from src.baselines.snapkv import evict_snapkv
@@ -188,6 +192,9 @@ def run_tdc_policy(
     budget: int,
     theta: float = 0.3,
     recent_window: int = 16,
+    allow_level2_fallback: bool = True,
+    min_budget_utilization: float = 0.99,
+    max_budget_shortfall_tokens: int = 1,
 ) -> tuple[EvictionResult, torch.Tensor, CacheMetrics]:
     tiers = assign_protection_tiers(
         chunk_scores=sample.chunk_scores,
@@ -205,6 +212,7 @@ def run_tdc_policy(
         k_cache=sample.k_cache,
         v_cache=sample.v_cache,
         budget=budget,
+        allow_level2_fallback=allow_level2_fallback,
     )
     latency_ms = (time.perf_counter() - t0) * 1000.0
     metrics = compute_cache_metrics(
@@ -213,6 +221,11 @@ def run_tdc_policy(
         budget=budget,
         kept_length=int(result.kept_indices.numel()),
         latency_ms=latency_ms,
+    )
+    validate_budget_contract(
+        metrics,
+        min_utilization=min_budget_utilization,
+        max_shortfall_tokens=max_budget_shortfall_tokens,
     )
     return result, tiers, metrics
 
@@ -280,6 +293,7 @@ def run_baseline_policy(
         kept_length=int(result.kept_indices.numel()),
         latency_ms=0.0,
     )
+    validate_budget_contract(metrics)
     return result, metrics
 
 

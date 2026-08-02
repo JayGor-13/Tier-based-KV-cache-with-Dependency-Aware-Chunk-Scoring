@@ -21,6 +21,24 @@ def parse_args():
     parser.add_argument("--recent-windows", type=str, default="16", help="Comma-separated list of recent windows")
     parser.add_argument("--alphas", type=str, default="0.6", help="Comma-separated list of alpha values")
     parser.add_argument(
+        "--max-chunk-tokens",
+        type=int,
+        default=64,
+        help="Maximum tokens in a semantic chunk",
+    )
+    parser.add_argument(
+        "--min-budget-utilization",
+        type=float,
+        default=0.99,
+        help="Minimum allowed kept-token utilization of the target budget",
+    )
+    parser.add_argument(
+        "--max-budget-shortfall-tokens",
+        type=int,
+        default=1,
+        help="Maximum allowed target-budget underfill in tokens",
+    )
+    parser.add_argument(
         "--dependency-top-k",
         type=int,
         default=8,
@@ -53,7 +71,12 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=50, help="Max new tokens to generate")
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
     parser.add_argument("--dtype", type=str, default="auto", help="Torch dtype")
-    parser.add_argument("--allow-level2-fallback", action="store_true", help="Allow eviction of tier-2 chunks if budget is too strict")
+    parser.add_argument(
+        "--allow-level2-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow Tier-2 fallback so matched-budget runs remain strict",
+    )
     
     parser.add_argument("--output", type=str, default="outputs/hf_grid_results.json", help="Output JSON path")
     return parser.parse_args()
@@ -81,6 +104,9 @@ def main():
         thetas=thetas,
         recent_windows=recent_windows,
         alphas=alphas,
+        max_chunk_tokens=args.max_chunk_tokens,
+        min_budget_utilization=args.min_budget_utilization,
+        max_budget_shortfall_tokens=args.max_budget_shortfall_tokens,
         dependency_top_k=args.dependency_top_k,
         prefill_block_size=args.prefill_block_size,
         tier1_score_mode=args.tier1_score_mode,

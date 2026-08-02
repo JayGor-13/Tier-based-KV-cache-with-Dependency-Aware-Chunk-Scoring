@@ -82,6 +82,50 @@ class TestChunkerModule1(unittest.TestCase):
         self.assertEqual(_to_lists(chunks), [[0, 1, 2]])
         self.assertEqual(chunk_map.tolist(), [0, 0, 0])
 
+    def test_forward_splits_punctuation_free_span_at_maximum_size(self):
+        constructor = SentenceBoundaryChunkConstructor(
+            tokenizer=None,
+            punct_ids={999},
+            min_chunk_tokens=1,
+            max_chunk_tokens=4,
+        )
+        token_ids = torch.arange(10, dtype=torch.long)
+
+        chunks, chunk_map = constructor.forward(token_ids)
+
+        self.assertEqual(
+            _to_lists(chunks),
+            [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]],
+        )
+        self.assertEqual(chunk_map.tolist(), [0, 0, 0, 0, 1, 1, 1, 1, 2, 2])
+        self.assertTrue(all(chunk.numel() <= 4 for chunk in chunks))
+
+    def test_forward_caps_chunks_after_small_sentence_merging(self):
+        constructor = SentenceBoundaryChunkConstructor(
+            tokenizer=None,
+            punct_ids={2, 3},
+            min_chunk_tokens=3,
+            max_chunk_tokens=4,
+        )
+        token_ids = torch.tensor([10, 2, 11, 3, 12, 13], dtype=torch.long)
+
+        chunks, chunk_map = constructor.forward(token_ids)
+
+        self.assertEqual(_to_lists(chunks), [[0, 1, 2, 3], [4, 5]])
+        self.assertEqual(chunk_map.tolist(), [0, 0, 0, 0, 1, 1])
+
+    def test_constructor_rejects_incompatible_chunk_limits(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "max_chunk_tokens must be greater than or equal",
+        ):
+            SentenceBoundaryChunkConstructor(
+                tokenizer=None,
+                punct_ids={1},
+                min_chunk_tokens=5,
+                max_chunk_tokens=4,
+            )
+
     def test_forward_with_empty_input_returns_empty_outputs(self):
         constructor = SentenceBoundaryChunkConstructor(
             tokenizer=None,
@@ -155,6 +199,34 @@ class TestChunkerModule1(unittest.TestCase):
         self.assertEqual(_to_lists(chunks), [[0, 1, 2], [3]])
         self.assertEqual(chunk_map.tolist(), [0, 0, 0, 1])
 
+    def test_update_rolls_over_at_maximum_chunk_size(self):
+        constructor = SentenceBoundaryChunkConstructor(
+            tokenizer=None,
+            punct_ids={9},
+            min_chunk_tokens=1,
+            max_chunk_tokens=3,
+        )
+        chunks = [torch.tensor([0, 1], dtype=torch.long)]
+        chunk_map = torch.tensor([0, 0], dtype=torch.long)
+
+        chunks, chunk_map = constructor.update(
+            chunks=chunks,
+            chunk_map=chunk_map,
+            new_token_id=7,
+            new_position=2,
+        )
+        self.assertEqual(_to_lists(chunks), [[0, 1, 2], []])
+        self.assertEqual(chunk_map.tolist(), [0, 0, 0])
+
+        chunks, chunk_map = constructor.update(
+            chunks=chunks,
+            chunk_map=chunk_map,
+            new_token_id=7,
+            new_position=3,
+        )
+        self.assertEqual(_to_lists(chunks), [[0, 1, 2], [3]])
+        self.assertEqual(chunk_map.tolist(), [0, 0, 0, 1])
+
     def test_update_validates_new_position_matches_sequence_length(self):
         constructor = SentenceBoundaryChunkConstructor(
             tokenizer=None,
@@ -191,6 +263,8 @@ class TestChunkerModule1(unittest.TestCase):
             "2",
             "--min-chunk-tokens",
             "1",
+            "--max-chunk-tokens",
+            "3",
         ]
         result = subprocess.run(
             command,
@@ -202,6 +276,7 @@ class TestChunkerModule1(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["chunks"], [[0, 1, 2], [3]])
         self.assertEqual(payload["map"], [0, 0, 0, 1])
+        self.assertEqual(payload["max_chunk_tokens"], 3)
 
 
 if __name__ == "__main__":

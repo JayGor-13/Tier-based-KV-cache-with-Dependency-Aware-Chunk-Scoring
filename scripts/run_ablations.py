@@ -88,6 +88,9 @@ def main() -> None:
             "budget": args.budget,
             "theta_grid": theta_grid,
             "recent_window_grid": recent_window_grid,
+            "allow_level2_fallback": True,
+            "min_budget_utilization": 0.99,
+            "max_budget_shortfall_tokens": 1,
         },
         "ablations": ablation_rows,
     }

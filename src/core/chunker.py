@@ -13,6 +13,7 @@ from torch import Tensor
 
 
 MIN_CHUNK_TOKENS: int = 5
+MAX_CHUNK_TOKENS: int = 64
 DEFAULT_BOUNDARY_CHARS: set[str] = {".", ",", "?", "!", ";", ":"}
 
 
@@ -46,6 +47,7 @@ class SentenceBoundaryChunkConstructor:
         self,
         tokenizer: Any | None = None,
         min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+        max_chunk_tokens: int = MAX_CHUNK_TOKENS,
         device: str | torch.device = "cpu",
         punct_ids: set[int] | None = None,
     ) -> None:
@@ -57,8 +59,19 @@ class SentenceBoundaryChunkConstructor:
                 raise ValueError("Provide either `tokenizer` or `punct_ids`.")
             punct_ids = build_punctuation_vocab(tokenizer)
 
-        self.punct_ids: set[int] = set(punct_ids)
         self.min_chunk_tokens = int(min_chunk_tokens)
+        self.max_chunk_tokens = int(max_chunk_tokens)
+        if self.min_chunk_tokens <= 0:
+            raise ValueError("min_chunk_tokens must be positive.")
+        if self.max_chunk_tokens <= 0:
+            raise ValueError("max_chunk_tokens must be positive.")
+        if self.max_chunk_tokens < self.min_chunk_tokens:
+            raise ValueError(
+                "max_chunk_tokens must be greater than or equal to "
+                "min_chunk_tokens."
+            )
+
+        self.punct_ids: set[int] = set(punct_ids)
         self.device = torch.device(device)
 
     def forward(self, X: Tensor) -> tuple[list[Tensor], Tensor]:
@@ -78,7 +91,8 @@ class SentenceBoundaryChunkConstructor:
         boundary_mask = self._compute_boundary_mask(token_ids)
         boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(1)
         raw_chunks = self._build_raw_chunks(boundary_positions, sequence_length)
-        chunks = self._merge_small_chunks(raw_chunks)
+        merged_chunks = self._merge_small_chunks(raw_chunks)
+        chunks = self._split_oversized_chunks(merged_chunks)
         chunk_map = self._build_chunk_map(chunks, sequence_length)
         return chunks, chunk_map
 
@@ -155,6 +169,17 @@ class SentenceBoundaryChunkConstructor:
 
         return merged_chunks
 
+    def _split_oversized_chunks(self, chunks: list[Tensor]) -> list[Tensor]:
+        """Split long semantic spans while preserving their token order."""
+        bounded_chunks: list[Tensor] = []
+        for chunk in chunks:
+            chunk_length = int(chunk.numel())
+            for start in range(0, chunk_length, self.max_chunk_tokens):
+                bounded_chunks.append(
+                    chunk[start : start + self.max_chunk_tokens]
+                )
+        return bounded_chunks
+
     def _build_chunk_map(self, chunks: list[Tensor], sequence_length: int) -> Tensor:
         """
         Build map tensor of shape [t] where map[i] = k means token i in chunk k.
@@ -202,22 +227,31 @@ class SentenceBoundaryChunkConstructor:
 
         if len(normalized_chunks) == 0:
             normalized_chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
+        elif normalized_chunks[-1].numel() >= self.max_chunk_tokens:
+            normalized_chunks.append(
+                torch.empty(0, dtype=torch.long, device=self.device)
+            )
 
-        if token_is_boundary:
-            if normalized_chunks[-1].numel() == 0:
-                normalized_chunks[-1] = new_position_tensor
-            else:
-                normalized_chunks[-1] = torch.cat([normalized_chunks[-1], new_position_tensor])
-            new_chunk_map[new_position] = len(normalized_chunks) - 1
-            if normalized_chunks[-1].numel() >= self.min_chunk_tokens:
-                normalized_chunks.append(torch.empty(0, dtype=torch.long, device=self.device))
+        active_chunk_index = len(normalized_chunks) - 1
+        if normalized_chunks[-1].numel() == 0:
+            normalized_chunks[-1] = new_position_tensor
         else:
-            active_chunk_index = len(normalized_chunks) - 1
-            if normalized_chunks[-1].numel() == 0:
-                normalized_chunks[-1] = new_position_tensor
-            else:
-                normalized_chunks[-1] = torch.cat([normalized_chunks[-1], new_position_tensor])
-            new_chunk_map[new_position] = active_chunk_index
+            normalized_chunks[-1] = torch.cat(
+                [normalized_chunks[-1], new_position_tensor]
+            )
+        new_chunk_map[new_position] = active_chunk_index
+
+        chunk_is_full = (
+            normalized_chunks[-1].numel() >= self.max_chunk_tokens
+        )
+        closes_sentence = (
+            token_is_boundary
+            and normalized_chunks[-1].numel() >= self.min_chunk_tokens
+        )
+        if chunk_is_full or closes_sentence:
+            normalized_chunks.append(
+                torch.empty(0, dtype=torch.long, device=self.device)
+            )
 
         return normalized_chunks, new_chunk_map
 
@@ -226,6 +260,7 @@ def build_module1(
     tokenizer: Any,
     device: str | torch.device = "cpu",
     min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+    max_chunk_tokens: int = MAX_CHUNK_TOKENS,
 ) -> SentenceBoundaryChunkConstructor:
     """
     Factory function to construct and return a ready-to-use Module 1 instance.
@@ -233,6 +268,7 @@ def build_module1(
     return SentenceBoundaryChunkConstructor(
         tokenizer=tokenizer,
         min_chunk_tokens=min_chunk_tokens,
+        max_chunk_tokens=max_chunk_tokens,
         device=device,
     )
 
@@ -241,6 +277,7 @@ def chunk_token_ids(
     token_ids: Iterable[int] | Tensor,
     punct_ids: Iterable[int],
     min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+    max_chunk_tokens: int = MAX_CHUNK_TOKENS,
     device: str | torch.device = "cpu",
 ) -> tuple[list[list[int]], list[int]]:
     """
@@ -254,6 +291,7 @@ def chunk_token_ids(
     constructor = SentenceBoundaryChunkConstructor(
         tokenizer=None,
         min_chunk_tokens=min_chunk_tokens,
+        max_chunk_tokens=max_chunk_tokens,
         device=device,
         punct_ids=set(punct_ids),
     )
@@ -295,6 +333,12 @@ def _main(argv: list[str] | None = None) -> int:
         help="Minimum chunk size before merge behavior is applied.",
     )
     parser.add_argument(
+        "--max-chunk-tokens",
+        type=int,
+        default=MAX_CHUNK_TOKENS,
+        help="Maximum chunk size after sentence-boundary construction.",
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         help='Torch device string, for example: "cpu" or "cuda".',
@@ -314,11 +358,14 @@ def _main(argv: list[str] | None = None) -> int:
         token_ids=token_ids,
         punct_ids=punct_ids,
         min_chunk_tokens=args.min_chunk_tokens,
+        max_chunk_tokens=args.max_chunk_tokens,
         device=args.device,
     )
     payload = {
         "token_ids": token_ids,
         "punct_ids": sorted(punct_ids),
+        "min_chunk_tokens": args.min_chunk_tokens,
+        "max_chunk_tokens": args.max_chunk_tokens,
         "num_chunks": len(chunks),
         "chunks": chunks,
         "map": chunk_map,

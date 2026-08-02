@@ -21,6 +21,48 @@ class EvictionResult:
     keep_mask: torch.Tensor
     target_deficit: int
     tokens_removed: int
+    budget_shortfall: int = 0
+    budget_overflow: int = 0
+    budget_utilization: float = 1.0
+    partially_evicted_chunks: int = 0
+
+
+@dataclass(frozen=True)
+class BudgetStatus:
+    """Token-budget occupancy measured against the usable target budget."""
+
+    target_budget: int
+    kept_tokens: int
+    shortfall: int
+    overflow: int
+    utilization: float
+
+
+def compute_budget_status(
+    *,
+    sequence_length: int,
+    budget: int,
+    kept_tokens: int,
+) -> BudgetStatus:
+    if sequence_length < 0 or budget < 0 or kept_tokens < 0:
+        raise ValueError("sequence_length, budget, and kept_tokens must be non-negative.")
+    if kept_tokens > sequence_length:
+        raise ValueError("kept_tokens cannot exceed sequence_length.")
+
+    target_budget = min(int(sequence_length), int(budget))
+    shortfall = max(target_budget - int(kept_tokens), 0)
+    overflow = max(int(kept_tokens) - target_budget, 0)
+    if target_budget == 0:
+        utilization = 1.0 if kept_tokens == 0 else 0.0
+    else:
+        utilization = int(kept_tokens) / float(target_budget)
+    return BudgetStatus(
+        target_budget=target_budget,
+        kept_tokens=int(kept_tokens),
+        shortfall=shortfall,
+        overflow=overflow,
+        utilization=utilization,
+    )
 
 
 def _to_index_tensor(chunk: Chunk, *, device: torch.device) -> torch.Tensor:
@@ -70,10 +112,17 @@ def _remove_chunks_by_priority(
         token_idx = _to_index_tensor(chunks[chunk_idx], device=keep_mask.device)
         _validate_token_indices(token_idx, keep_mask.numel())
 
-        active_before = keep_mask[token_idx]
-        removed_now = int(active_before.sum().item())
-        keep_mask[token_idx] = False
-        removed_so_far += removed_now
+        active_positions = torch.sort(token_idx[keep_mask[token_idx]]).values
+        removed_now = int(active_positions.numel())
+        remaining = deficit - removed_so_far
+        if removed_now > remaining:
+            # Refine only the final boundary chunk. Keeping its later positions
+            # preserves the more recent part of an otherwise equally scored span.
+            keep_mask[active_positions[:remaining]] = False
+            removed_so_far += remaining
+        else:
+            keep_mask[active_positions] = False
+            removed_so_far += removed_now
 
         if removed_so_far >= deficit:
             break
@@ -200,6 +249,19 @@ def evict_kv_cache(
 
     kept_indices = torch.nonzero(keep_mask, as_tuple=False).flatten()
     removed_indices = torch.nonzero(~keep_mask, as_tuple=False).flatten()
+    budget_status = compute_budget_status(
+        sequence_length=sequence_length,
+        budget=budget,
+        kept_tokens=int(kept_indices.numel()),
+    )
+    partially_evicted_chunks = 0
+    for chunk in chunks:
+        token_idx = _to_index_tensor(chunk, device=keep_mask.device)
+        if token_idx.numel() == 0:
+            continue
+        kept_in_chunk = int(keep_mask[token_idx].sum().item())
+        if 0 < kept_in_chunk < int(token_idx.numel()):
+            partially_evicted_chunks += 1
 
     new_k_cache = select_cache_positions(k_cache, kept_indices)
     new_v_cache = select_cache_positions(v_cache, kept_indices)
@@ -212,11 +274,17 @@ def evict_kv_cache(
         keep_mask=keep_mask,
         target_deficit=max(sequence_length - budget, 0),
         tokens_removed=tokens_removed,
+        budget_shortfall=budget_status.shortfall,
+        budget_overflow=budget_status.overflow,
+        budget_utilization=budget_status.utilization,
+        partially_evicted_chunks=partially_evicted_chunks,
     )
 
 
 __all__ = [
+    "BudgetStatus",
     "EvictionResult",
+    "compute_budget_status",
     "compute_keep_mask",
     "evict_kv_cache",
     "select_cache_positions",

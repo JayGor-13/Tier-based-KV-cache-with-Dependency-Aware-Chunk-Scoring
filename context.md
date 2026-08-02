@@ -12,8 +12,9 @@ eviction with dependency-aware chunk scoring. The design details live in
 
 1. Module 1, `src/core/chunker.py`
    - Builds sentence/punctuation-boundary chunks from token ids.
+   - Splits punctuation-free or merged spans at `max_chunk_tokens=64`.
    - Returns ordered chunk tensors and a token-to-chunk map.
-   - Supports a one-token incremental append path.
+   - Supports a one-token incremental append path with the same size cap.
 
 2. Module 2, `src/core/scorer.py`
    - Computes attention-mass signal `M` from observed attention `[H,w,t]`.
@@ -30,13 +31,15 @@ eviction with dependency-aware chunk scoring. The design details live in
 
 4. Module 4, `src/core/evictor.py`
    - Removes whole chunks by ascending score from Tier 0 first, then Tier 1.
+   - Boundary-refines at most one selected chunk by removing its oldest
+     positions, preventing whole-chunk budget underfill.
    - Never removes Tier 2 unless `allow_level2_fallback=True`.
    - Selects cache positions along sequence axis `-2`, so both `[H,t,d]` and
      batched cache layouts are supported.
    - `src/models/cache_manager.py` keeps logical positions and chunk metadata
      aligned with the compacted cache and re-evicts after every decode step.
    - Decode-time trimming guarantees the post-step cache does not exceed the
-     configured budget, using logged Tier-2 fallback only when unavoidable.
+     configured budget and uses the same final-group boundary refinement.
 
 5. Benchmarks and baselines
    - `benchmarks/pipeline.py` runs TDC-KV and baseline policies from precomputed
@@ -63,6 +66,10 @@ eviction with dependency-aware chunk scoring. The design details live in
   `transformers` when the tokenizer-loading CLI path is used.
 - Module 1 incremental updates normalize `chunk_map` and chunk tensors to the
   constructor device before appending.
+- Module 1 bounds every semantic chunk with configurable `max_chunk_tokens`,
+  preventing punctuation-free contexts from causing extreme budget underfill.
+- Module 4 now meets matched token budgets through a single partial boundary
+  chunk after applying normal tier and chunk-score ordering.
 - Module 4 now normalizes `mask_tiers` to the `chunk_scores` device in direct
   `compute_keep_mask` calls.
 - H2O and SnapKV baselines now trim lowest-scored forced keeps when sink/recent
@@ -102,8 +109,9 @@ after smoke checks.
 - The prefill evictor can report an over-budget Tier-2-protected result. Before
   generation, the decoding cache manager applies a logged Tier-2 fallback and
   enforces the strict budget; both pre-manager and effective sizes are logged.
-- Whole-chunk eviction can undershoot the exact budget because it removes
-  complete chunks. Decode-time cache size nevertheless remains at or below it.
+- Matched-budget paths validate at least 99% utilization, at most one token of
+  shortfall, and zero overflow. Disabling Tier-2 fallback is an explicit
+  protection stress test and may intentionally violate the matched budget.
 - HuggingFace prefill processes bounded query blocks with a cumulative KV cache.
   Each block is consumed online into the sparse graph and final observation
   window, so dense attention retention is bounded by the configured block size.

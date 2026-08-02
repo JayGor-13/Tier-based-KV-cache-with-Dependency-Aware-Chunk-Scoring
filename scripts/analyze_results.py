@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from benchmarks.eval_metrics import summarize_qa  # noqa: E402
+
+
 def analyze_results(json_path: str):
     path = Path(json_path)
     if not path.exists():
@@ -39,11 +42,18 @@ def analyze_results(json_path: str):
         runs_by_ratio[bin_name].append(run)
 
     print("### Matched-Budget Evaluation (MBE) Results\n")
-    print("| Method (Retention %) | Compression CR | Baseline F1 | Evicted F1 | F1 Drop |")
-    print("|----------------------|----------------|-------------|------------|---------|")
+    print(
+        "| Method (Retention %) | Compression CR | Primary Metric | "
+        "Baseline | Evicted | Delta |"
+    )
+    print(
+        "|----------------------|----------------|----------------|"
+        "----------|---------|-------|"
+    )
 
-    # If the global baseline isn't perfect due to some failed runs, we calculate it dynamically
-    baseline_f1 = data["summary"].get("baseline_qa_summary", {}).get("f1", 0.0) * 100
+    baseline_summary = data["summary"].get("baseline_qa_summary", {})
+    baseline_metric = baseline_summary.get("primary_metric") or "unavailable"
+    baseline_score = float(baseline_summary.get("primary_score") or 0.0) * 100
 
     for bin_name in ["50.0%", "25.0%", "12.5%", "6.25%"]:
         if bin_name not in runs_by_ratio:
@@ -65,20 +75,31 @@ def analyze_results(json_path: str):
         valid_multipliers = [m for m in multipliers if m != float('inf')]
         avg_cr = sum(valid_multipliers) / len(valid_multipliers) if valid_multipliers else float('inf')
         
-        # We need to manually calculate the evicted F1 for this specific bin
-        # The F1 calculation here is a rough average of the F1 scores inside the bin
-        from benchmarks.eval_metrics import token_f1
-        f1_scores = []
-        for r in bin_runs:
-            pred = str(r.get("evicted_prediction", ""))
-            gold = str(r.get("gold", ""))
-            f1_scores.append(token_f1(pred, gold))
-            
-        evicted_f1 = (sum(f1_scores) / len(f1_scores)) * 100 if f1_scores else 0.0
-        f1_drop = evicted_f1 - baseline_f1
+        qa_rows = [
+            {
+                "prediction": str(run.get("evicted_prediction", "")),
+                "gold": str(run.get("gold", "")),
+                "dataset": str(run.get("dataset", "")),
+            }
+            for run in bin_runs
+            if run.get("gold") is not None
+        ]
+        evicted_summary = summarize_qa(qa_rows)
+        evicted_metric = evicted_summary.get("primary_metric") or "unavailable"
+        if baseline_metric != evicted_metric:
+            raise ValueError(
+                "Baseline and evicted metric families do not match: "
+                f"{baseline_metric!r} != {evicted_metric!r}."
+            )
+        evicted_score = float(evicted_summary.get("primary_score") or 0.0) * 100
+        score_delta = evicted_score - baseline_score
         
         # Format the row
-        row = f"| TDC-KV ({bin_name}) | {avg_cr:.2f}x | {baseline_f1:.2f}% | {evicted_f1:.2f}% | {f1_drop:+.2f}% |"
+        row = (
+            f"| TDC-KV ({bin_name}) | {avg_cr:.2f}x | {evicted_metric} | "
+            f"{baseline_score:.2f}% | {evicted_score:.2f}% | "
+            f"{score_delta:+.2f}% |"
+        )
         print(row)
 
 if __name__ == "__main__":

@@ -113,3 +113,29 @@ def test_manager_compacts_every_dynamic_cache_layer():
     for key, value in cache_layer_tensors(compacted):
         assert key.shape[-2] == manager.cache_length
         assert value.shape[-2] == manager.cache_length
+
+
+def test_manager_boundary_refines_coarse_group_to_exact_budget():
+    manager = DecodingCacheManager.from_prompt(
+        budget=2,
+        recent_window=0,
+        kept_indices=torch.arange(4),
+        original_sequence_length=4,
+        chunks=[torch.tensor([0]), torch.tensor([1, 2, 3])],
+        chunk_scores=torch.tensor([1.0, 0.1]),
+        mask_tiers=torch.tensor([2, 0], dtype=torch.int8),
+    )
+    k_cache, v_cache = _cache(4)
+
+    _, _, event = manager.trim_cache_tensors(
+        k_cache,
+        v_cache,
+        current_logical_length=4,
+    )
+
+    assert manager.cache_length == 2
+    assert manager.logical_positions.tolist() == [0, 3]
+    assert event.groups_removed == 0
+    assert event.partially_trimmed_groups == 1
+    assert event.boundary_refinement_tokens == 2
+    assert manager.summary()["boundary_refinement_events"] == 1

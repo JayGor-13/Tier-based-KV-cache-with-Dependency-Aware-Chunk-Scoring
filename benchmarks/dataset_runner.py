@@ -46,6 +46,10 @@ def run_dataset_benchmark(
                 "budget": run_budget,
                 "kept_tokens": int(result.kept_indices.numel()),
                 "removed_tokens": int(result.removed_indices.numel()),
+                "partially_evicted_chunks": result.partially_evicted_chunks,
+                "budget_utilization": result.budget_utilization,
+                "budget_shortfall": result.budget_shortfall,
+                "budget_overflow": result.budget_overflow,
                 "tier0_chunks": int((tiers == 0).sum().item()),
                 "tier1_chunks": int((tiers == 1).sum().item()),
                 "tier2_chunks": int((tiers == 2).sum().item()),
@@ -54,7 +58,13 @@ def run_dataset_benchmark(
         )
 
         if sample.prediction is not None and sample.gold is not None:
-            qa_rows.append({"prediction": sample.prediction, "gold": sample.gold})
+            qa_rows.append(
+                {
+                    "prediction": sample.prediction,
+                    "gold": sample.gold,
+                    "dataset": dataset_name,
+                }
+            )
 
     payload = {
         "dataset": dataset_name,
@@ -64,6 +74,9 @@ def run_dataset_benchmark(
             "theta": theta,
             "recent_window": recent_window,
             "method": "tdc_kv",
+            "allow_level2_fallback": True,
+            "min_budget_utilization": 0.99,
+            "max_budget_shortfall_tokens": 1,
         },
         "cache_summary": summarize_cache_metrics(metrics),
         "qa_summary": summarize_qa(qa_rows),

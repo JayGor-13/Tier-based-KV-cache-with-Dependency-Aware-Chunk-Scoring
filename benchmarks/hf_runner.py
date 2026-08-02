@@ -19,6 +19,7 @@ from benchmarks.eval_metrics import (
     compute_cache_metrics,
     summarize_cache_metrics,
     summarize_qa,
+    validate_budget_contract,
 )
 from src.baselines.chunkkv import evict_chunkkv
 from src.baselines.h2o import evict_h2o
@@ -641,6 +642,21 @@ def _tier_counts(tiers: torch.Tensor) -> dict[str, int]:
     }
 
 
+def _chunk_size_metrics(chunks: list[torch.Tensor]) -> dict[str, int | float]:
+    sizes = [int(chunk.numel()) for chunk in chunks]
+    if not sizes:
+        return {
+            "min_chunk_size": 0,
+            "max_chunk_size": 0,
+            "avg_chunk_size": 0.0,
+        }
+    return {
+        "min_chunk_size": min(sizes),
+        "max_chunk_size": max(sizes),
+        "avg_chunk_size": sum(sizes) / float(len(sizes)),
+    }
+
+
 def normalize_methods(methods: Iterable[str] | None) -> list[str]:
     """Normalize and validate experiment method names."""
     if methods is None:
@@ -836,6 +852,9 @@ def run_hf_grid(
     attention_mode: str = "last",
     layer_index: int = -1,
     min_chunk_tokens: int = 5,
+    max_chunk_tokens: int = 64,
+    min_budget_utilization: float = 0.99,
+    max_budget_shortfall_tokens: int = 1,
     dependency_top_k: int = 8,
     prefill_block_size: int = 128,
     tier1_score_mode: str = "dependency",
@@ -843,7 +862,7 @@ def run_hf_grid(
     dtype: str = "auto",
     trust_remote_code: bool = False,
     attn_implementation: str | None = "eager",
-    allow_level2_fallback: bool = False,
+    allow_level2_fallback: bool = True,
     continue_on_error: bool = True,
 ) -> dict[str, Any]:
     """Run TDC-KV over all requested model/dataset/parameter combinations."""
@@ -859,6 +878,17 @@ def run_hf_grid(
         raise ValueError("At least one alpha value is required.")
     if prefill_block_size <= 0:
         raise ValueError("prefill_block_size must be positive.")
+    if max_chunk_tokens <= 0:
+        raise ValueError("max_chunk_tokens must be positive.")
+    if max_chunk_tokens < min_chunk_tokens:
+        raise ValueError(
+            "max_chunk_tokens must be greater than or equal to "
+            "min_chunk_tokens."
+        )
+    if not 0.0 <= min_budget_utilization <= 1.0:
+        raise ValueError("min_budget_utilization must be in [0, 1].")
+    if max_budget_shortfall_tokens < 0:
+        raise ValueError("max_budget_shortfall_tokens must be non-negative.")
     experiment_methods = normalize_methods(methods)
     tier1_score_mode = tier1_score_mode.strip().lower()
     if tier1_score_mode not in {"dependency", "fused", "none"}:
@@ -897,6 +927,7 @@ def run_hf_grid(
         chunk_constructor = SentenceBoundaryChunkConstructor(
             tokenizer=bundle.tokenizer,
             min_chunk_tokens=min_chunk_tokens,
+            max_chunk_tokens=max_chunk_tokens,
             device="cpu",
         )
 
@@ -916,7 +947,7 @@ def run_hf_grid(
                         max_new_tokens=max_new_tokens,
                         max_length=max_length,
                     )
-                    if prediction and gold is not None:
+                    if gold is not None:
                         baseline_qa_rows.append(
                             {
                                 "prediction": prediction,
@@ -935,6 +966,7 @@ def run_hf_grid(
                         attention_mode=attention_mode,
                         layer_index=layer_index,
                         min_chunk_tokens=min_chunk_tokens,
+                        max_chunk_tokens=max_chunk_tokens,
                         dependency_top_k=dependency_top_k,
                         prefill_block_size=prefill_block_size,
                         chunk_constructor=chunk_constructor,
@@ -952,6 +984,7 @@ def run_hf_grid(
                     )
                     continue
 
+                chunk_size_metrics = _chunk_size_metrics(prefill.chunks)
                 if "fullkv" in experiment_methods:
                     full_metrics = compute_cache_metrics(
                         sample_id=sample_id,
@@ -961,7 +994,7 @@ def run_hf_grid(
                         latency_ms=0.0,
                     )
                     method_metric_rows["fullkv"].append(full_metrics)
-                    if prediction and gold is not None:
+                    if gold is not None:
                         _append_method_quality(
                             method_qa_rows, "fullkv", prediction, gold, spec.name
                         )
@@ -980,11 +1013,21 @@ def run_hf_grid(
                                 "attention_mode": attention_mode,
                                 "layer_index": int(layer_index),
                                 "attention_collection": "blockwise",
+                                "min_chunk_tokens": int(min_chunk_tokens),
+                                "max_chunk_tokens": int(max_chunk_tokens),
+                                "min_budget_utilization": float(
+                                    min_budget_utilization
+                                ),
+                                "max_budget_shortfall_tokens": int(
+                                    max_budget_shortfall_tokens
+                                ),
                                 "prefill_block_size": int(prefill_block_size),
                             },
                             "sequence_length": prefill.sequence_length,
                             "prefill_blocks": prefill.prefill_blocks,
                             "num_chunks": len(prefill.chunks),
+                            **chunk_size_metrics,
+                            "partially_evicted_chunks": 0,
                             "tier_counts": None,
                             "kept_tokens": prefill.sequence_length,
                             "removed_tokens": 0,
@@ -1070,6 +1113,14 @@ def run_hf_grid(
                                 "layer_index": int(layer_index),
                                 "dependency_top_k": int(dependency_top_k),
                                 "attention_collection": "blockwise",
+                                "min_chunk_tokens": int(min_chunk_tokens),
+                                "max_chunk_tokens": int(max_chunk_tokens),
+                                "min_budget_utilization": float(
+                                    min_budget_utilization
+                                ),
+                                "max_budget_shortfall_tokens": int(
+                                    max_budget_shortfall_tokens
+                                ),
                                 "prefill_block_size": int(prefill_block_size),
                                 "tier1_score_mode": tier1_score_mode,
                             }
@@ -1094,6 +1145,15 @@ def run_hf_grid(
                                     budget=int(budget),
                                     kept_length=int(eviction.kept_indices.numel()),
                                     latency_ms=elapsed_ms,
+                                )
+                                validate_budget_contract(
+                                    metrics,
+                                    min_utilization=float(
+                                        min_budget_utilization
+                                    ),
+                                    max_shortfall_tokens=int(
+                                        max_budget_shortfall_tokens
+                                    ),
                                 )
                                 metric_rows.append(metrics)
                                 method_metric_rows[method].append(metrics)
@@ -1162,6 +1222,10 @@ def run_hf_grid(
                                         "sequence_length": prefill.sequence_length,
                                         "prefill_blocks": prefill.prefill_blocks,
                                         "num_chunks": len(prefill.chunks),
+                                        **chunk_size_metrics,
+                                        "partially_evicted_chunks": int(
+                                            eviction.partially_evicted_chunks
+                                        ),
                                         "dependency_edges": (
                                             int(
                                                 (
@@ -1241,6 +1305,9 @@ def run_hf_grid(
             "attention_mode": attention_mode,
             "layer_index": layer_index,
             "min_chunk_tokens": min_chunk_tokens,
+            "max_chunk_tokens": max_chunk_tokens,
+            "min_budget_utilization": min_budget_utilization,
+            "max_budget_shortfall_tokens": max_budget_shortfall_tokens,
             "dependency_top_k": dependency_top_k,
             "attention_collection": "blockwise",
             "prefill_block_size": prefill_block_size,
