@@ -49,8 +49,11 @@ def _model_for_family(family):
             n_embd=16,
             n_layer=2,
             n_head=2,
+            bos_token_id=1,
+            eos_token_id=2,
             use_cache=True,
         )
+        config._attn_implementation = "eager"
         model = GPT2LMHeadModel(config)
     elif family == "llama":
         from transformers import LlamaConfig, LlamaForCausalLM
