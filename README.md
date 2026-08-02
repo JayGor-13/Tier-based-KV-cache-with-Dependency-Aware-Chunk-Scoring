@@ -51,9 +51,9 @@ python -c "import src.core; import src.baselines; print('imports ok')"
 ```
 
 The offline HuggingFace end-to-end tests instantiate tiny random GPT-2, Llama,
-and Qwen2 models. They verify compressed-cache logit parity, global
-`cache_position` handling, exact token-granular budgets, and repeated
-decode-time re-eviction without downloading checkpoints.
+and Qwen2 models. They verify compressed-cache logit parity, global logical
+position handling across Transformers 4/5, exact token-granular budgets, and
+repeated decode-time re-eviction without downloading checkpoints.
 
 ## Trace Smoke Runs
 

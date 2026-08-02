@@ -151,7 +151,8 @@ Generated tokens use individual groups in the current implementation. They remai
 
 Offline integration tests exercise this invariant with tiny GPT-2, Llama, and
 Qwen2 causal language models. They compare compressed-cache logits against an
-independent forward pass, verify logical `cache_position` values for RoPE
+independent forward pass, verify global `position_ids` and version-dependent
+`cache_position` values for RoPE
 families, and require exact budget occupancy after repeated token-granular
 decode eviction. Whole-chunk prefill eviction may still underfill the budget.
 
