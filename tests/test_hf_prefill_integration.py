@@ -75,6 +75,7 @@ def test_real_hf_prefill_reaches_dependency_tiered_kv_eviction():
             observation_window=2,
             attention_mode="last",
             min_chunk_tokens=1,
+            max_chunk_tokens=2,
             dependency_top_k=2,
             prefill_block_size=3,
         )
@@ -84,6 +85,8 @@ def test_real_hf_prefill_reaches_dependency_tiered_kv_eviction():
     assert prefill_query_lengths == [3, 3, 2]
     assert prefill.prefill_blocks == 3
     assert prefill.prefill_block_size == 3
+    assert prefill.max_chunk_tokens == 2
+    assert max(chunk.numel() for chunk in prefill.chunks) <= 2
     assert prefill.attention_obs.shape == (2, 2, 8)
     assert prefill.next_token_id == direct_next_token
     assert torch.allclose(

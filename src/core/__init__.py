@@ -1,6 +1,12 @@
 """Core TDC-KV components."""
 
-from .evictor import EvictionResult, compute_keep_mask, evict_kv_cache
+from .evictor import (
+    BudgetStatus,
+    EvictionResult,
+    compute_budget_status,
+    compute_keep_mask,
+    evict_kv_cache,
+)
 from .dependency_graph import (
     SparseChunkDependencyGraph,
     SparseChunkDependencyGraphBuilder,
@@ -10,6 +16,7 @@ from .dependency_graph import (
 from .masker import MaskerResult, assign_protection_tiers, find_chunk_index, infer_sequence_length
 from .chunker import (
     DEFAULT_BOUNDARY_CHARS,
+    MAX_CHUNK_TOKENS,
     MIN_CHUNK_TOKENS,
     SentenceBoundaryChunkConstructor,
     build_module1,
@@ -23,6 +30,7 @@ from .scorer import (
 )
 __all__ = [
     "DEFAULT_BOUNDARY_CHARS",
+    "MAX_CHUNK_TOKENS",
     "MIN_CHUNK_TOKENS",
     "SentenceBoundaryChunkConstructor",
     "build_module1",
@@ -31,11 +39,13 @@ __all__ = [
     "DualSignalScorer",
     "ScorerResult",
     "build_module2",
+    "BudgetStatus",
     "EvictionResult",
     "MaskerResult",
     "assign_protection_tiers",
     "aggregate_attention_rows",
     "build_sparse_chunk_dependency_graph",
+    "compute_budget_status",
     "compute_keep_mask",
     "evict_kv_cache",
     "find_chunk_index",

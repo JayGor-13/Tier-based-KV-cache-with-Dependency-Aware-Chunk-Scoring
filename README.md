@@ -73,19 +73,31 @@ python scripts/run_hf_grid.py \
   --datasets "name=gsm8k,source=openai/gsm8k,config=main,split=test,prompt_field=question,answer_field=answer" \
   --methods fullkv,tdc_kv \
   --budget-ratios 0.5 \
+  --max-chunk-tokens 64 \
+  --min-budget-utilization 0.99 \
+  --max-budget-shortfall-tokens 1 \
+  --allow-level2-fallback \
   --prefill-block-size 128 \
   --max-samples 5 \
   --output outputs/hf_smoke.json
 ```
 
-Lower `--prefill-block-size` to reduce peak attention memory. Larger blocks use
+`--max-chunk-tokens` bounds punctuation-free spans. Eviction removes ranked
+whole chunks until the final boundary, then trims only the oldest required
+positions from that chunk to satisfy the matched token budget. The utilization
+and shortfall flags make this an executable result contract. Lower
+`--prefill-block-size` to reduce peak attention memory. Larger blocks use
 fewer model calls but materialize larger `[layers, heads, block, prefix]`
 attention tensors. Result JSON records the configured size and actual block count.
 
 HF result JSON also contains `grouped_results`, aggregated by model, dataset,
 method, requested budget specification, and all remaining configuration values.
 Each group includes run/error counts, cache and QA metrics, sequence and resolved
-budget distributions, decode-cache diagnostics, and tier-count summaries.
+budget distributions, decode-cache diagnostics, and tier-count summaries. QA
+summaries expose a dataset-aware `primary_metric`/`primary_score`: extracted
+numeric accuracy for GSM8K, exact needle retrieval accuracy for NIAH, and the
+official normalized answer F1 for HotpotQA. Generic full-output EM/F1 remain as
+diagnostics and must not be used as the headline paper score.
 
 To rebuild grouped summaries from an existing result file:
 

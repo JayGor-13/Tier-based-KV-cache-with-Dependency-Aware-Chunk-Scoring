@@ -90,9 +90,11 @@ For publication, the critical baselines are FullKV, StreamingLLM, H2O, SnapKV, C
 
 | Metric | Definition | Datasets |
 |---|---|---|
-| Accuracy | Correct final answer / total examples | GSM8K, NIAH |
-| Exact Match | Normalized exact string match | GSM8K, HotpotQA, NIAH |
-| Token F1 | Token overlap F1 between prediction and gold answer | HotpotQA, 2Wiki, MuSiQue, LongBench QA |
+| GSM8K accuracy | Exact equality of the extracted final numeric answer; references use the value after `####` | GSM8K |
+| NIAH retrieval accuracy | Fraction of outputs containing the complete normalized needle as a contiguous token sequence | NIAH |
+| HotpotQA answer F1 | Official normalized token-overlap F1, including the special `yes`/`no`/`noanswer` rule | HotpotQA |
+| HotpotQA answer EM | Official lowercase, punctuation/article-removed exact match | HotpotQA |
+| Generic output EM/F1 | Full-generation string diagnostics only; never the headline score for the three main datasets | All |
 | Pass@1 | Single deterministic rollout correctness | Optional for AIME/HMMT-style KVpop comparison |
 | Rouge-L | LongBench summarization only | Optional |
 | Edit similarity | LongBench code tasks only | Optional |
@@ -110,7 +112,10 @@ Already implemented in `benchmarks/eval_metrics.py`:
 | Retention ratio | Kept length / original length. |
 | Compression ratio | 1 - retention ratio. |
 | Compression multiplier | Original length / kept length. |
-| Budget gap | Kept length - budget. Important because whole-chunk eviction can overshoot. |
+| Budget gap | Kept length - budget; zero is expected for matched-budget runs. |
+| Budget utilization | Kept length / min(budget, original length). Must be at least 0.99. |
+| Budget shortfall | max(target budget - kept length, 0). Must be at most one token. |
+| Budget overflow | max(kept length - target budget, 0). Must be zero. |
 | Latency ms | Time spent scoring and evicting, or end-to-end generation latency in HF runs. |
 
 Add for final paper:
@@ -226,9 +231,12 @@ Parameters:
 | `recent_window` | 8, 16, 32, 64, 128 | 16 |
 | `alpha` | 0.0, 0.25, 0.5, 0.6, 0.75, 1.0 | 0.6 |
 | `min_chunk_tokens` | 1, 4, 8, 16, 32 | 5 |
+| `max_chunk_tokens` | 32, 64, 128 | 64 |
 | budget ratio | 0.5, 0.25, 0.125, 0.0625 | 0.25 |
 | layer mode | last layer, all layers uniform, all layers weighted | last/all depending final choice |
-| `allow_level2_fallback` | false, true | false |
+| `allow_level2_fallback` | false, true | true for matched-budget results |
+| minimum budget utilization | 0.95, 0.99, 1.0 | 0.99 |
+| maximum budget shortfall | 0, 1, 4 tokens | 1 token |
 | Tier-1 score mode | dependency, fused, none | dependency |
 
 Report as:
@@ -382,6 +390,10 @@ python scripts\run_hf_grid.py `
   --thetas "0.3" `
   --recent-windows "16" `
   --alphas "0.6" `
+  --max-chunk-tokens 64 `
+  --min-budget-utilization 0.99 `
+  --max-budget-shortfall-tokens 1 `
+  --allow-level2-fallback `
   --max-samples 200 `
   --max-length 8192 `
   --prefill-block-size 128 `
@@ -454,10 +466,11 @@ The current codebase is a good prototype, but publication-quality comparison nee
    - Needed for PyramidKV comparison and layer-weight ablation.
    - Log kept counts per layer and attention-mode choice.
 
-8. Fix exact-budget reporting.
-   - TDC-KV whole-chunk eviction can exceed budget due to Tier 2 protection or chunk granularity.
-   - Always report `budget_gap`.
-   - For matched-budget tables, either enable `allow_level2_fallback` only in a separate stress test, or tune recent-window and chunk size so budget gaps are small.
+8. Enforce exact-budget reporting.
+   - TDC-KV uses whole-chunk ranking plus one partial boundary chunk to avoid granularity underfill.
+   - Tier 2 fallback is required for matched-budget results; disabling it is a separate protection stress test.
+   - Always report `budget_gap`, `budget_utilization`, `budget_shortfall`, and `budget_overflow`.
+   - Matched-budget tables require Tier-2 fallback, at least 99% utilization, at most one token shortfall, and zero overflow.
 
 ## 10. Ablation Studies In Detail
 
@@ -584,6 +597,7 @@ Stage 1: small sample grid.
   - `recent_window`: 8, 16, 32, 64
   - `alpha`: 0.25, 0.5, 0.6, 0.75, 1.0
   - `min_chunk_tokens`: 1, 4, 8, 16
+  - `max_chunk_tokens`: 32, 64, 128
 
 Stage 2: final confirmation.
 
@@ -670,7 +684,7 @@ Avoid overclaiming:
 
 - Do not claim to beat KVpop unless we run its public implementation or checkpoint under the same models/datasets/budgets.
 - Do not claim PyramidKV-style layer allocation unless a true layerwise budget baseline is implemented.
-- Do not claim exact budget matching unless `budget_gap` is near zero or fallback policy is enabled.
+- Do not include a run in matched-budget tables unless its utilization contract passes. Report Tier-2-preserving over-budget runs separately as a protection stress test.
 
 Best comparison framing:
 

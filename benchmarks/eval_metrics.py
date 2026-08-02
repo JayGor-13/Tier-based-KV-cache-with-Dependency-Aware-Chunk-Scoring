@@ -6,10 +6,13 @@ from collections import Counter
 import json
 import re
 import statistics
+import string
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Iterable
+
+from src.core.evictor import compute_budget_status
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,10 @@ class CacheMetrics:
     compression_ratio: float
     compression_multiplier: float
     budget_gap: int
+    target_budget: int
+    budget_shortfall: int
+    budget_overflow: int
+    budget_utilization: float
     latency_ms: float
 
     def to_dict(self) -> dict:
@@ -42,6 +49,11 @@ def compute_cache_metrics(
     compression = 1.0 - retention
     multiplier = (float(original_length) / kept_length) if kept_length > 0 else float("inf")
     gap = kept_length - budget
+    budget_status = compute_budget_status(
+        sequence_length=original_length,
+        budget=budget,
+        kept_tokens=kept_length,
+    )
     return CacheMetrics(
         sample_id=sample_id,
         original_length=original_length,
@@ -52,8 +64,42 @@ def compute_cache_metrics(
         compression_ratio=compression,
         compression_multiplier=multiplier,
         budget_gap=gap,
+        target_budget=budget_status.target_budget,
+        budget_shortfall=budget_status.shortfall,
+        budget_overflow=budget_status.overflow,
+        budget_utilization=budget_status.utilization,
         latency_ms=float(latency_ms),
     )
+
+
+def validate_budget_contract(
+    metrics: CacheMetrics,
+    *,
+    min_utilization: float = 0.99,
+    max_shortfall_tokens: int = 1,
+    allow_overflow: bool = False,
+) -> None:
+    """Require a matched-budget result within explicit occupancy tolerances."""
+    if not 0.0 <= min_utilization <= 1.0:
+        raise ValueError("min_utilization must be in [0, 1].")
+    if max_shortfall_tokens < 0:
+        raise ValueError("max_shortfall_tokens must be non-negative.")
+    if metrics.budget_overflow > 0 and not allow_overflow:
+        raise ValueError(
+            f"Cache exceeds target budget by {metrics.budget_overflow} tokens."
+        )
+    if metrics.budget_shortfall > max_shortfall_tokens:
+        raise ValueError(
+            "Cache budget shortfall "
+            f"{metrics.budget_shortfall} exceeds tolerance "
+            f"{max_shortfall_tokens}."
+        )
+    if metrics.budget_utilization < min_utilization:
+        raise ValueError(
+            "Cache budget utilization "
+            f"{metrics.budget_utilization:.6f} is below required "
+            f"{min_utilization:.6f}."
+        )
 
 
 def _mean(values: Iterable[float]) -> float:
@@ -72,6 +118,12 @@ def summarize_cache_metrics(metrics: list[CacheMetrics]) -> dict:
             "avg_compression_ratio": 0.0,
             "avg_compression_multiplier": 0.0,
             "avg_budget_gap": 0.0,
+            "avg_budget_utilization": 0.0,
+            "min_budget_utilization": 0.0,
+            "avg_budget_shortfall": 0.0,
+            "max_budget_shortfall": 0,
+            "budget_overflow_count": 0,
+            "exact_budget_match_rate": 0.0,
             "avg_latency_ms": 0.0,
             "p50_latency_ms": 0.0,
             "p90_latency_ms": 0.0,
@@ -95,6 +147,17 @@ def summarize_cache_metrics(metrics: list[CacheMetrics]) -> dict:
         "avg_compression_ratio": _mean(m.compression_ratio for m in metrics),
         "avg_compression_multiplier": _mean(multipliers) if multipliers else float("inf"),
         "avg_budget_gap": _mean(float(m.budget_gap) for m in metrics),
+        "avg_budget_utilization": _mean(m.budget_utilization for m in metrics),
+        "min_budget_utilization": min(m.budget_utilization for m in metrics),
+        "avg_budget_shortfall": _mean(float(m.budget_shortfall) for m in metrics),
+        "max_budget_shortfall": max(m.budget_shortfall for m in metrics),
+        "budget_overflow_count": sum(1 for m in metrics if m.budget_overflow > 0),
+        "exact_budget_match_rate": _mean(
+            1.0
+            if m.budget_shortfall == 0 and m.budget_overflow == 0
+            else 0.0
+            for m in metrics
+        ),
         "avg_latency_ms": _mean(latencies),
         "p50_latency_ms": float(p50),
         "p90_latency_ms": float(p90),
@@ -194,13 +257,159 @@ def final_answer_f1(prediction: str, gold: str) -> float:
     return token_f1(pred, ref)
 
 
+def gsm8k_accuracy(prediction: str, gold: str) -> float:
+    """Score a GSM8K completion by its extracted final numeric answer."""
+    return final_answer_exact_match(prediction, gold)
+
+
+def niah_retrieval_match(prediction: str, gold: str) -> float:
+    """Return one when the normalized needle occurs as a full token sequence."""
+    prediction_tokens = _normalize_answer(prediction).split()
+    gold_tokens = _normalize_answer(gold).split()
+    if not prediction_tokens or not gold_tokens:
+        return 0.0
+
+    width = len(gold_tokens)
+    return float(
+        any(
+            prediction_tokens[start : start + width] == gold_tokens
+            for start in range(len(prediction_tokens) - width + 1)
+        )
+    )
+
+
+def _normalize_hotpotqa_answer(text: str) -> str:
+    """Apply the normalization used by the official HotpotQA evaluator."""
+    lowered = str(text or "").lower()
+    without_punctuation = "".join(
+        character for character in lowered if character not in string.punctuation
+    )
+    without_articles = re.sub(r"\b(a|an|the)\b", " ", without_punctuation)
+    return " ".join(without_articles.split())
+
+
+def hotpotqa_exact_match(prediction: str, gold: str) -> float:
+    """Compute official normalized answer exact match for HotpotQA."""
+    return float(
+        _normalize_hotpotqa_answer(prediction) == _normalize_hotpotqa_answer(gold)
+    )
+
+
+def _hotpotqa_prf(prediction: str, gold: str) -> tuple[float, float, float]:
+    normalized_prediction = _normalize_hotpotqa_answer(prediction)
+    normalized_gold = _normalize_hotpotqa_answer(gold)
+    special_answers = {"yes", "no", "noanswer"}
+    if (
+        normalized_prediction in special_answers
+        or normalized_gold in special_answers
+    ) and normalized_prediction != normalized_gold:
+        return 0.0, 0.0, 0.0
+
+    prediction_tokens = normalized_prediction.split()
+    gold_tokens = normalized_gold.split()
+    common = Counter(prediction_tokens) & Counter(gold_tokens)
+    overlap = sum(common.values())
+    if overlap == 0:
+        return 0.0, 0.0, 0.0
+
+    precision = overlap / len(prediction_tokens)
+    recall = overlap / len(gold_tokens)
+    f1 = 2.0 * precision * recall / (precision + recall)
+    return f1, precision, recall
+
+
+def hotpotqa_f1(prediction: str, gold: str) -> float:
+    """Compute the answer F1 used by the official HotpotQA evaluator."""
+    f1, _, _ = _hotpotqa_prf(prediction, gold)
+    return f1
+
+
+def _dataset_family(dataset: str) -> str:
+    normalized = str(dataset or "").strip().lower().replace("-", "_")
+    if "gsm8k" in normalized:
+        return "gsm8k"
+    if "niah" in normalized or "needle" in normalized:
+        return "niah"
+    if "hotpot" in normalized:
+        return "hotpotqa"
+    return "generic"
+
+
 def _needs_final_answer_score(rec: dict, gold: str) -> bool:
-    dataset = str(rec.get("dataset", "")).lower()
-    return "gsm8k" in dataset or "####" in gold
+    return _dataset_family(str(rec.get("dataset", ""))) == "gsm8k" or "####" in gold
+
+
+def _summarize_task_family(family: str, records: list[dict]) -> dict:
+    pairs = [
+        (str(record.get("prediction", "")), str(record.get("gold", "")))
+        for record in records
+    ]
+
+    if family == "gsm8k":
+        accuracy = _mean(gsm8k_accuracy(prediction, gold) for prediction, gold in pairs)
+        answer_f1 = _mean(final_answer_f1(prediction, gold) for prediction, gold in pairs)
+        return {
+            "count": len(records),
+            "primary_metric": "gsm8k_accuracy",
+            "primary_score": accuracy,
+            "secondary_metric": "gsm8k_final_answer_f1",
+            "secondary_score": answer_f1,
+            "accuracy": accuracy,
+            "final_answer_f1": answer_f1,
+        }
+
+    if family == "niah":
+        retrieval_accuracy = _mean(
+            niah_retrieval_match(prediction, gold) for prediction, gold in pairs
+        )
+        normalized_em = _mean(exact_match(prediction, gold) for prediction, gold in pairs)
+        return {
+            "count": len(records),
+            "primary_metric": "niah_retrieval_accuracy",
+            "primary_score": retrieval_accuracy,
+            "secondary_metric": "niah_exact_match",
+            "secondary_score": normalized_em,
+            "retrieval_accuracy": retrieval_accuracy,
+            "exact_match": normalized_em,
+        }
+
+    if family == "hotpotqa":
+        prf_scores = [
+            _hotpotqa_prf(prediction, gold) for prediction, gold in pairs
+        ]
+        answer_f1 = _mean(score[0] for score in prf_scores)
+        answer_precision = _mean(score[1] for score in prf_scores)
+        answer_recall = _mean(score[2] for score in prf_scores)
+        answer_em = _mean(
+            hotpotqa_exact_match(prediction, gold) for prediction, gold in pairs
+        )
+        return {
+            "count": len(records),
+            "primary_metric": "hotpotqa_f1",
+            "primary_score": answer_f1,
+            "secondary_metric": "hotpotqa_exact_match",
+            "secondary_score": answer_em,
+            "f1": answer_f1,
+            "precision": answer_precision,
+            "recall": answer_recall,
+            "exact_match": answer_em,
+        }
+
+    generic_f1 = _mean(token_f1(prediction, gold) for prediction, gold in pairs)
+    generic_em = _mean(exact_match(prediction, gold) for prediction, gold in pairs)
+    return {
+        "count": len(records),
+        "primary_metric": "token_f1",
+        "primary_score": generic_f1,
+        "secondary_metric": "exact_match",
+        "secondary_score": generic_em,
+        "f1": generic_f1,
+        "exact_match": generic_em,
+    }
 
 
 def summarize_qa(predictions: list[dict]) -> dict:
-    """Summarize QA metrics for records containing `prediction` and `gold`."""
+    """Summarize generic diagnostics and dataset-specific primary metrics."""
     if not predictions:
         return {
             "count": 0,
@@ -209,20 +418,48 @@ def summarize_qa(predictions: list[dict]) -> dict:
             "final_answer_count": 0,
             "final_answer_exact_match": 0.0,
             "final_answer_f1": 0.0,
+            "task_family": None,
+            "primary_metric": None,
+            "primary_score": None,
+            "secondary_metric": None,
+            "secondary_score": None,
+            "dataset_metrics": {},
         }
 
     em_scores = []
     f1_scores = []
     final_em_scores = []
     final_f1_scores = []
+    family_records: dict[str, list[dict]] = {}
     for rec in predictions:
         pred = str(rec.get("prediction", ""))
         gold = str(rec.get("gold", ""))
         em_scores.append(exact_match(pred, gold))
         f1_scores.append(token_f1(pred, gold))
+        family = _dataset_family(str(rec.get("dataset", "")))
+        family_records.setdefault(family, []).append(rec)
         if _needs_final_answer_score(rec, gold):
             final_em_scores.append(final_answer_exact_match(pred, gold))
             final_f1_scores.append(final_answer_f1(pred, gold))
+
+    dataset_metrics = {
+        family: _summarize_task_family(family, records)
+        for family, records in sorted(family_records.items())
+    }
+    if len(dataset_metrics) == 1:
+        task_family, task_summary = next(iter(dataset_metrics.items()))
+        primary_metric = task_summary["primary_metric"]
+        primary_score = task_summary["primary_score"]
+        secondary_metric = task_summary["secondary_metric"]
+        secondary_score = task_summary["secondary_score"]
+    else:
+        task_family = "mixed"
+        primary_metric = "macro_task_score"
+        primary_score = _mean(
+            summary["primary_score"] for summary in dataset_metrics.values()
+        )
+        secondary_metric = None
+        secondary_score = None
 
     return {
         "count": len(predictions),
@@ -231,6 +468,12 @@ def summarize_qa(predictions: list[dict]) -> dict:
         "final_answer_count": len(final_em_scores),
         "final_answer_exact_match": _mean(final_em_scores),
         "final_answer_f1": _mean(final_f1_scores),
+        "task_family": task_family,
+        "primary_metric": primary_metric,
+        "primary_score": primary_score,
+        "secondary_metric": secondary_metric,
+        "secondary_score": secondary_score,
+        "dataset_metrics": dataset_metrics,
     }
 
 
@@ -325,7 +568,13 @@ def aggregate_grouped_runs(runs: list[dict]) -> list[dict]:
             bucket["runs"].append(run)
 
     results: list[dict] = []
-    cache_fields = set(CacheMetrics.__dataclass_fields__)
+    required_cache_fields = {
+        "sample_id",
+        "original_length",
+        "budget",
+        "kept_length",
+        "latency_ms",
+    }
     for group_key in sorted(grouped):
         bucket = grouped[group_key]
         group_runs = bucket["runs"]
@@ -338,19 +587,27 @@ def aggregate_grouped_runs(runs: list[dict]) -> list[dict]:
         resolved_budget_records: list[dict] = []
         decode_records: list[dict] = []
         tier_records: list[dict] = []
+        chunk_records: list[dict] = []
 
         for run in successful:
             metric_payload = run.get("metrics")
-            if isinstance(metric_payload, dict) and cache_fields.issubset(metric_payload):
+            if (
+                isinstance(metric_payload, dict)
+                and required_cache_fields.issubset(metric_payload)
+            ):
                 cache_metrics.append(
-                    CacheMetrics(
-                        **{key: metric_payload[key] for key in cache_fields}
+                    compute_cache_metrics(
+                        sample_id=str(metric_payload["sample_id"]),
+                        original_length=int(metric_payload["original_length"]),
+                        budget=int(metric_payload["budget"]),
+                        kept_length=int(metric_payload["kept_length"]),
+                        latency_ms=float(metric_payload["latency_ms"]),
                     )
                 )
 
             prediction = run.get("evicted_prediction", run.get("prediction"))
             gold = run.get("gold")
-            if prediction not in {None, ""} and gold is not None:
+            if prediction is not None and gold is not None:
                 qa_rows.append(
                     {
                         "prediction": str(prediction),
@@ -377,6 +634,19 @@ def aggregate_grouped_runs(runs: list[dict]) -> list[dict]:
                 decode_records.append(run["decode_cache_summary"])
             if isinstance(run.get("tier_counts"), dict):
                 tier_records.append(run["tier_counts"])
+            chunk_record = {
+                field: run[field]
+                for field in (
+                    "num_chunks",
+                    "min_chunk_size",
+                    "max_chunk_size",
+                    "avg_chunk_size",
+                    "partially_evicted_chunks",
+                )
+                if isinstance(run.get(field), (int, float))
+            }
+            if chunk_record:
+                chunk_records.append(chunk_record)
 
         error_types = Counter(str(run.get("error_type") or "UnknownError") for run in failed)
         dimensions = bucket["dimensions"]
@@ -404,6 +674,7 @@ def aggregate_grouped_runs(runs: list[dict]) -> list[dict]:
                 ),
                 "decode_cache_summary": _numeric_field_summary(decode_records),
                 "tier_summary": _numeric_field_summary(tier_records),
+                "chunk_summary": _numeric_field_summary(chunk_records),
             }
         )
 
@@ -418,7 +689,12 @@ __all__ = [
     "extract_final_answer",
     "final_answer_exact_match",
     "final_answer_f1",
+    "gsm8k_accuracy",
+    "hotpotqa_exact_match",
+    "hotpotqa_f1",
+    "niah_retrieval_match",
     "summarize_cache_metrics",
     "summarize_qa",
     "token_f1",
+    "validate_budget_contract",
 ]

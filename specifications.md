@@ -19,12 +19,14 @@ The pipeline *only* triggers when a new token causes **$t > B$**.
 
 **Parameters:**
 *   **$P_{vocab}$:** A constant `set` of integers. These are the token IDs for `{ . , ? , ! , ; , : }` loaded directly from the model's Tokenizer.
+*   **$C_{max}=64$:** Maximum tokens per chunk. Longer punctuation-free spans are split into contiguous bounded subchunks.
 
 **Mathematical Transformation:**
 1.  Boolean masking: Create $B \in \{0, 1\}^{t}$ where $B[i] = 1$ if $X[i] \in P_{vocab}$, else $0$.
 2.  Find indices where $B=1$. Let this be vector $\mathbf{p} = [p_1, p_2, \dots, p_m]$.
 3.  Define bounds: $p_0 = 0$, $p_{m+1} = t$.
 4.  Construct list of index arrays: $C_k = [p_{k-1}+1 \dots p_k]$ for $k=1 \dots m+1$.
+5.  Split every $C_k$ longer than $C_{max}$ into ordered contiguous subchunks, preserving complete token coverage and enforcing $|C_k| \le C_{max}$.
 
 **Outputs (Data leaving Mod 1):**
 *   **$\mathbf{C}$**: A `list of 1D tensors/arrays` representing the token indices belonging to each chunk. (Total $M$ chunks).
@@ -121,11 +123,11 @@ Everything is now shipped to the Executor (**Module 4**), containing the final v
 2.  Identify **Target 0 chunks**: $Q_0 = \{ k \mid \mathbf{\Pi}[k] == 0 \}$. Sort $Q_0$ in *ascending* order based on $\mathbf{Score_{chunk}}[k]$.
 3.  Loop through sorted $Q_0$:
     *   Let $idx$ = token indices for chunk $C_{curr}$.
-    *   Set `KeepMask`$[idx]$ = `False`.
-    *   TokensRemoved += $|C_{curr}|$
-    *   If TokensRemoved $\ge$ Deficit: `BREAK loop`
-4.  *Safety Net:* If TokensRemoved < Deficit (we ran out of Level 0s), repeat Steps 2 & 3 but targeting Level 1 chunks ($Q_1$). *(Level 2s are literally skipped, loop impossible here).*
-5.  Get non-deleted integer indices: `idx_retained = torch.nonzero(KeepMask)`. This creates a flattened index of shape `[Final_Count]` where $Final\_Count \approx B$.
+    *   If $|C_{curr}|$ does not exceed the remaining deficit, remove the complete chunk.
+    *   Otherwise, remove exactly the remaining number of oldest positions from $C_{curr}$ and retain its later positions.
+    *   Stop when TokensRemoved equals Deficit. Thus at most one boundary chunk is partially evicted.
+4.  *Safety Net:* If TokensRemoved < Deficit, repeat Steps 2 and 3 for Level 1, then Level 2 only when matched-budget fallback is enabled.
+5.  Get non-deleted integer indices: `idx_retained = torch.nonzero(KeepMask)`. For matched-budget runs, `Final_Count = min(B,t)`.
 
 **Outputs (Returning to the base LLM Model):**
 *   **$K_{cache}^{new} = K_{cache}[\text{:} \:, idx\_retained, \text{: }]$** (New Shape: `[H, Final_Count, d]`).
@@ -140,12 +142,13 @@ For each decode step:
 1. Process one generated token, temporarily growing the cache by one position.
 2. Append matching metadata for that position.
 3. If the cache exceeds $B$, remove complete Tier-0 groups by ascending fused score, then Tier-1 groups.
-4. If Tier-2 tokens alone exceed $B$, remove the oldest non-sink Tier-2 groups and record a fallback event.
+4. When the final selected group is larger than the remaining deficit, trim only its oldest required positions. At most one group is partially trimmed per enforcement pass.
+5. If Tier-2 tokens alone exceed $B$, apply the same oldest-position boundary refinement and record a fallback event.
 5. Apply the retained physical indices to every key/value layer and rebuild the model cache.
 
 The enforced invariant is:
 
-$$|K_{cache}^{post-step}| = |V_{cache}^{post-step}| \le B$$
+$$|K_{cache}^{post-step}| = |V_{cache}^{post-step}| = \min(B,t)$$
 
 Generated tokens use individual groups in the current implementation. They remain Tier 2 while inside the recent window and become low-priority eviction candidates after aging out.
 
@@ -154,12 +157,33 @@ Qwen2 causal language models. They compare compressed-cache logits against an
 independent forward pass, verify global `position_ids` and version-dependent
 `cache_position` values for RoPE
 families, and require exact budget occupancy after repeated token-granular
-decode eviction. Whole-chunk prefill eviction may still underfill the budget.
+decode eviction. Prefill and decode use the same final-group boundary
+refinement, and matched-budget experiments require utilization of at least
+`0.99`, shortfall of at most one token, and zero overflow.
 
 All cache tensor access passes through a shared HuggingFace compatibility
 adapter. It supports legacy tuple caches, v4 cache lists, and v5
 `DynamicCache.layers` while exposing the same ordered key/value layer contract
 to prefill extraction and decode-time compaction.
+
+### Dataset Evaluation Contract
+
+Every QA summary retains generic full-generation EM/F1 for debugging and also
+publishes `primary_metric` and `primary_score` for result tables:
+
+* GSM8K uses accuracy of the extracted final numeric answer. The reference is
+  read after `####`; generated text uses its `####` suffix, boxed answer, or
+  final numeric value in that order.
+* NIAH uses exact retrieval accuracy. A response is correct only when the full
+  normalized needle appears as a contiguous token sequence, so verbose answers
+  are accepted but partial-key collisions are rejected.
+* HotpotQA uses the official normalized answer F1 as primary and official answer
+  EM as secondary, including the special handling for `yes`, `no`, and
+  `noanswer`.
+
+Empty generations remain in the denominator as incorrect predictions. A
+multi-dataset aggregate reports an unweighted `macro_task_score`; paper tables
+must use the per-dataset grouped results rather than generic output F1.
 
 ### Final Check
 

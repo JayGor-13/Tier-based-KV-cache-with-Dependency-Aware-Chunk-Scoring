@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from benchmarks.hf_runner import (
@@ -7,6 +8,7 @@ from benchmarks.hf_runner import (
     build_prompt_from_record,
     load_dataset_records,
     parse_dataset_spec,
+    run_hf_grid,
     _run_eviction_method,
 )
 
@@ -108,6 +110,24 @@ def test_generic_dataset_prompt_path_still_uses_prompt_field_only():
 
     assert prompt == "Say hello"
     assert gold is None
+
+
+def test_hf_grid_rejects_max_chunk_size_below_minimum():
+    with pytest.raises(
+        ValueError,
+        match="max_chunk_tokens must be greater than or equal",
+    ):
+        run_hf_grid(
+            model_names=["unused/model"],
+            dataset_specs=[DatasetSpec(name="unused", source="unused.jsonl")],
+            budgets=[],
+            budget_ratios=[0.5],
+            thetas=[0.3],
+            recent_windows=[16],
+            alphas=[0.6],
+            min_chunk_tokens=8,
+            max_chunk_tokens=4,
+        )
 
 
 def test_hf_runner_dependency_tier_mode_changes_bridge_survival():

@@ -47,6 +47,7 @@ class HfPrefillRecord:
     v_cache: torch.Tensor
     dependency_graph: SparseChunkDependencyGraph | None = None
     next_token_id: int | None = None
+    max_chunk_tokens: int | None = None
     prefill_block_size: int | None = None
     prefill_blocks: int = 1
 
@@ -376,6 +377,7 @@ def run_hf_prefill(
     attention_mode: str = "last",
     layer_index: int = -1,
     min_chunk_tokens: int = 5,
+    max_chunk_tokens: int = 64,
     dependency_top_k: int | None = 8,
     prefill_block_size: int = 128,
     chunk_constructor: SentenceBoundaryChunkConstructor | None = None,
@@ -407,7 +409,10 @@ def run_hf_prefill(
     input_ids_cpu = input_ids[0].detach().cpu()
     if chunk_constructor is None:
         chunk_constructor = SentenceBoundaryChunkConstructor(
-            tokenizer=tokenizer, min_chunk_tokens=min_chunk_tokens, device="cpu"
+            tokenizer=tokenizer,
+            min_chunk_tokens=min_chunk_tokens,
+            max_chunk_tokens=max_chunk_tokens,
+            device="cpu",
         )
     chunks, chunk_map = chunk_constructor.forward(input_ids_cpu)
     if chunk_map.ndim != 1 or chunk_map.numel() != input_ids_cpu.numel():
@@ -553,6 +558,7 @@ def run_hf_prefill(
         v_cache=v_cache,
         dependency_graph=dependency_graph,
         next_token_id=next_token_id,
+        max_chunk_tokens=chunk_constructor.max_chunk_tokens,
         prefill_block_size=block_size,
         prefill_blocks=prefill_blocks,
     )

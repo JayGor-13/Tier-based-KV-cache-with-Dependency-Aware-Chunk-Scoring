@@ -19,6 +19,8 @@ class CacheTrimEvent:
     tokens_after: int
     tokens_removed: int
     groups_removed: int
+    partially_trimmed_groups: int
+    boundary_refinement_tokens: int
     used_tier2_fallback: bool
 
     def to_dict(self) -> dict[str, int | bool]:
@@ -248,6 +250,12 @@ class DecodingCacheManager:
             "total_tokens_removed": sum(
                 event.tokens_removed for event in self.events
             ),
+            "boundary_refinement_events": sum(
+                1 for event in self.events if event.partially_trimmed_groups > 0
+            ),
+            "boundary_refinement_tokens": sum(
+                event.boundary_refinement_tokens for event in self.events
+            ),
             "budget_violations": sum(
                 1 for event in self.events if event.tokens_after > self.budget
             ),
@@ -259,6 +267,8 @@ class DecodingCacheManager:
         tokens_before = self.cache_length
         keep_mask = torch.ones(tokens_before, dtype=torch.bool)
         removed_groups = 0
+        partially_trimmed_groups = 0
+        boundary_refinement_tokens = 0
         used_tier2_fallback = False
         recent_start = max(int(current_logical_length) - self.recent_window, 0)
 
@@ -284,8 +294,22 @@ class DecodingCacheManager:
             tier, _, _, _, selected_group = min(candidates)
             if tier == 2:
                 used_tier2_fallback = True
-            keep_mask[self.group_ids == selected_group] = False
-            removed_groups += 1
+            selected_positions = torch.nonzero(
+                keep_mask & (self.group_ids == selected_group),
+                as_tuple=False,
+            ).flatten()
+            excess = int(keep_mask.sum().item()) - self.budget
+            if selected_positions.numel() > excess:
+                logical_order = torch.argsort(
+                    self.logical_positions[selected_positions],
+                )
+                refined_positions = selected_positions[logical_order[:excess]]
+                keep_mask[refined_positions] = False
+                partially_trimmed_groups += 1
+                boundary_refinement_tokens += int(refined_positions.numel())
+            else:
+                keep_mask[selected_positions] = False
+                removed_groups += 1
 
         kept_positions = torch.nonzero(keep_mask, as_tuple=False).flatten()
         tokens_after = int(kept_positions.numel())
@@ -297,6 +321,8 @@ class DecodingCacheManager:
             tokens_after=tokens_after,
             tokens_removed=tokens_before - tokens_after,
             groups_removed=removed_groups,
+            partially_trimmed_groups=partially_trimmed_groups,
+            boundary_refinement_tokens=boundary_refinement_tokens,
             used_tier2_fallback=used_tier2_fallback,
         )
         return kept_positions, event

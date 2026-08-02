@@ -38,6 +38,10 @@ def _successful_run(
             "beta": 1.0 - alpha,
         },
         "sequence_length": sequence_length,
+        "num_chunks": 4,
+        "min_chunk_size": 20,
+        "max_chunk_size": 40,
+        "avg_chunk_size": 25.0,
         "kept_tokens": kept_tokens,
         "tier_counts": {"tier0": 2, "tier1": 1, "tier2": 1},
         "decode_cache_summary": {
@@ -93,10 +97,29 @@ def test_ratio_budget_groups_variable_length_samples_together():
     }
     assert result["cache_summary"]["count"] == 2
     assert result["qa_summary"]["final_answer_exact_match"] == 1.0
+    assert result["qa_summary"]["primary_metric"] == "gsm8k_accuracy"
+    assert result["qa_summary"]["primary_score"] == 1.0
     assert result["sequence_summary"]["sequence_length"]["avg"] == 125.0
     assert result["resolved_budget_summary"]["resolved_budget"]["min"] == 50.0
     assert result["resolved_budget_summary"]["resolved_budget"]["max"] == 75.0
     assert result["decode_cache_summary"]["re_eviction_events"]["sum"] == 6.0
+    assert result["chunk_summary"]["max_chunk_size"]["max"] == 40.0
+
+
+def test_grouped_results_count_empty_predictions_as_incorrect():
+    run = _successful_run(
+        "empty",
+        sequence_length=100,
+        resolved_budget=50,
+        kept_tokens=50,
+    )
+    run["evicted_prediction"] = ""
+
+    summary = aggregate_grouped_runs([run])[0]["qa_summary"]
+
+    assert summary["count"] == 1
+    assert summary["primary_metric"] == "gsm8k_accuracy"
+    assert summary["primary_score"] == 0.0
 
 
 def test_configuration_values_create_separate_groups():
