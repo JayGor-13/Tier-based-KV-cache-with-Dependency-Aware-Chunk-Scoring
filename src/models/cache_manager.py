@@ -7,6 +7,8 @@ from typing import Any, Sequence
 
 import torch
 
+from src.models.hf_cache_adapter import build_dynamic_cache, cache_layer_tensors
+
 Chunk = Sequence[int] | torch.Tensor
 
 
@@ -202,29 +204,25 @@ class DecodingCacheManager:
         *,
         current_logical_length: int,
     ) -> tuple[Any, CacheTrimEvent]:
-        legacy = past_key_values
-        if hasattr(legacy, "to_legacy_cache"):
-            legacy = legacy.to_legacy_cache()
-        elif hasattr(legacy, "key_cache") and hasattr(legacy, "value_cache"):
-            legacy = list(zip(legacy.key_cache, legacy.value_cache))
-        if not legacy:
-            raise ValueError("past_key_values contains no cache layers.")
-
-        first_key = legacy[0][0]
+        layers = cache_layer_tensors(past_key_values)
+        first_key = layers[0][0]
         self._validate_physical_length(int(first_key.shape[-2]))
         kept_positions, event = self._plan_trim(current_logical_length)
 
-        from transformers.cache_utils import DynamicCache
-
-        compacted = DynamicCache()
-        for layer_index, layer in enumerate(legacy):
-            key, value = layer[:2]
+        compacted_layers = []
+        for key, value in layers:
             index = kept_positions.to(device=key.device)
-            compacted.update(
-                torch.index_select(key, dim=-2, index=index),
-                torch.index_select(value, dim=-2, index=index.to(value.device)),
-                layer_idx=layer_index,
+            compacted_layers.append(
+                (
+                    torch.index_select(key, dim=-2, index=index),
+                    torch.index_select(
+                        value,
+                        dim=-2,
+                        index=index.to(value.device),
+                    ),
+                )
             )
+        compacted = build_dynamic_cache(compacted_layers)
         self._apply_trim(kept_positions, event)
         return compacted, event
 

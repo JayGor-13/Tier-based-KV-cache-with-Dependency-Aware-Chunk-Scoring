@@ -96,6 +96,9 @@ after smoke checks.
   parity and global cache positions. Large checkpoints and additional
   `transformers` releases still require smoke validation because cache APIs are
   model- and version-sensitive.
+- `src/models/hf_cache_adapter.py` normalizes legacy tuple caches, Transformers
+  v4 `key_cache/value_cache`, and Transformers v5 layer-based caches. Prefill
+  extraction, decode compaction, and cache reconstruction share this adapter.
 - The prefill evictor can report an over-budget Tier-2-protected result. Before
   generation, the decoding cache manager applies a logged Tier-2 fallback and
   enforces the strict budget; both pre-manager and effective sizes are logged.

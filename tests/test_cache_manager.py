@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from src.models.cache_manager import DecodingCacheManager
+from src.models.hf_cache_adapter import cache_layer_tensors
 
 
 def _manager(*, budget=4, recent_window=2):
@@ -97,7 +98,7 @@ def test_manager_compacts_every_dynamic_cache_layer():
 
     manager.append_generated_token(logical_position=4)
     grown_cache = DynamicCache()
-    for layer_idx, (key, value) in enumerate(dynamic_cache.to_legacy_cache()):
+    for layer_idx, (key, value) in enumerate(cache_layer_tensors(dynamic_cache)):
         grown_cache.update(
             torch.cat([key, torch.randn(1, 2, 1, 3)], dim=-2),
             torch.cat([value, torch.randn(1, 2, 1, 3)], dim=-2),
@@ -109,7 +110,6 @@ def test_manager_compacts_every_dynamic_cache_layer():
     )
 
     assert event.tokens_after <= manager.budget
-    for key, value in compacted.to_legacy_cache():
+    for key, value in cache_layer_tensors(compacted):
         assert key.shape[-2] == manager.cache_length
         assert value.shape[-2] == manager.cache_length
-
