@@ -90,6 +90,14 @@ and shortfall flags make this an executable result contract. Lower
 fewer model calls but materialize larger `[layers, heads, block, prefix]`
 attention tensors. Result JSON records the configured size and actual block count.
 
+Long HuggingFace runs print live model, sample, prefill, and method/budget
+progress by default. Pass `--no-progress` only when quiet output is required.
+
+For staged Colab execution, use `notebooks/tdc_kv_actual_testing.ipynb`. It
+verifies `branch-h`, CUDA, focused end-to-end tests, and one-sample smoke runs
+before exposing the larger GSM8K, NIAH, and HotpotQA pilot cells. Each run has
+a timeout and writes to a unique timestamped output directory.
+
 HF result JSON also contains `grouped_results`, aggregated by model, dataset,
 method, requested budget specification, and all remaining configuration values.
 Each group includes run/error counts, cache and QA metrics, sequence and resolved

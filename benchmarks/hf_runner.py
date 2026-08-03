@@ -864,6 +864,7 @@ def run_hf_grid(
     attn_implementation: str | None = "eager",
     allow_level2_fallback: bool = True,
     continue_on_error: bool = True,
+    progress: bool = False,
 ) -> dict[str, Any]:
     """Run TDC-KV over all requested model/dataset/parameter combinations."""
     if not model_names:
@@ -916,7 +917,12 @@ def run_hf_grid(
     evicted_qa_rows: list[dict[str, str]] = []
     max_observation_window = max(int(window) for window in recent_windows)
 
+    def report(message: str) -> None:
+        if progress:
+            print(message, flush=True)
+
     for model_name in model_names:
+        report(f"[model] Loading {model_name}...")
         bundle = load_hf_model_and_tokenizer(
             model_name,
             device=device,
@@ -924,6 +930,7 @@ def run_hf_grid(
             trust_remote_code=trust_remote_code,
             attn_implementation=attn_implementation,
         )
+        report(f"[model] Loaded {model_name}.")
         chunk_constructor = SentenceBoundaryChunkConstructor(
             tokenizer=bundle.tokenizer,
             min_chunk_tokens=min_chunk_tokens,
@@ -932,14 +939,20 @@ def run_hf_grid(
         )
 
         for spec in dataset_specs:
-            for sample_index, record in enumerate(dataset_records[spec.name]):
+            records = dataset_records[spec.name]
+            for sample_index, record in enumerate(records):
                 sample_id = str(
                     _get_nested(record, spec.id_field) or f"{spec.name}_{sample_index}"
+                )
+                report(
+                    f"[sample {sample_index + 1}/{len(records)}] "
+                    f"dataset={spec.name} id={sample_id}"
                 )
                 try:
                     prompt, gold = build_prompt_from_record(
                         record, spec, prompt_template=prompt_template
                     )
+                    report("  [fullkv] Generating baseline...")
                     prediction = generate_text(
                         model=bundle.model,
                         tokenizer=bundle.tokenizer,
@@ -947,6 +960,7 @@ def run_hf_grid(
                         max_new_tokens=max_new_tokens,
                         max_length=max_length,
                     )
+                    report("  [fullkv] Baseline generation complete.")
                     if gold is not None:
                         baseline_qa_rows.append(
                             {
@@ -956,6 +970,7 @@ def run_hf_grid(
                             }
                         )
 
+                    report("  [prefill] Collecting blockwise attention and KV cache...")
                     prefill = run_hf_prefill(
                         model=bundle.model,
                         tokenizer=bundle.tokenizer,
@@ -970,6 +985,10 @@ def run_hf_grid(
                         dependency_top_k=dependency_top_k,
                         prefill_block_size=prefill_block_size,
                         chunk_constructor=chunk_constructor,
+                    )
+                    report(
+                        f"  [prefill] Complete: tokens={prefill.sequence_length} "
+                        f"blocks={prefill.prefill_blocks} chunks={len(prefill.chunks)}"
                     )
                 except Exception as exc:
                     if not continue_on_error:
@@ -1088,6 +1107,7 @@ def run_hf_grid(
                                 config=config,
                             )
                         )
+                        report(f"  [error] {type(exc).__name__}: {exc}")
                         continue
 
                     for budget_configuration, theta in product(
@@ -1125,6 +1145,12 @@ def run_hf_grid(
                                 "tier1_score_mode": tier1_score_mode,
                             }
                             try:
+                                run_started = time.perf_counter()
+                                report(
+                                    f"  [{method}] budget={budget} "
+                                    f"theta={theta:g} alpha={alpha:g} "
+                                    f"recent_window={recent_window}"
+                                )
                                 started = time.perf_counter()
                                 eviction, masker_result = _run_eviction_method(
                                     method,
@@ -1274,6 +1300,11 @@ def run_hf_grid(
                                         "gold": gold,
                                     }
                                 )
+                                report(
+                                    f"  [{method}] Complete in "
+                                    f"{time.perf_counter() - run_started:.1f}s; "
+                                    f"kept={int(eviction.kept_indices.numel())}/{budget}"
+                                )
                             except Exception as exc:
                                 if not continue_on_error:
                                     raise
@@ -1285,6 +1316,9 @@ def run_hf_grid(
                                         error=exc,
                                         config=config,
                                     )
+                                )
+                                report(
+                                    f"  [{method}] Error: {type(exc).__name__}: {exc}"
                                 )
 
     grouped_results = aggregate_grouped_runs(runs)
