@@ -77,6 +77,12 @@ def parse_args():
         default=True,
         help="Allow Tier-2 fallback so matched-budget runs remain strict",
     )
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print live model, sample, prefill, and method progress",
+    )
     
     parser.add_argument("--output", type=str, default="outputs/hf_grid_results.json", help="Output JSON path")
     return parser.parse_args()
@@ -94,7 +100,11 @@ def main():
     alphas = [float(a.strip()) for a in args.alphas.split(",") if a.strip()]
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     
-    print(f"Running grid search for {len(models)} models and {len(datasets)} datasets...")
+    print(
+        f"Running grid search for {len(models)} models and "
+        f"{len(datasets)} datasets...",
+        flush=True,
+    )
     
     results = run_hf_grid(
         model_names=models,
@@ -117,12 +127,13 @@ def main():
         device=args.device,
         dtype=args.dtype,
         allow_level2_fallback=args.allow_level2_fallback,
+        progress=args.progress,
     )
     
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print(f"Results saved to {output_path}")
+    print(f"Results saved to {output_path}", flush=True)
 
 if __name__ == "__main__":
     main()
