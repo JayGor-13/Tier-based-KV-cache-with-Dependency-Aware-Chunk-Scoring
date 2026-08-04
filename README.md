@@ -151,3 +151,8 @@ The prompt is serialized and tokenized once; FullKV and cache prefill consume
 the same token tensors. Use `chat` for instruction checkpoints, `raw` for base
 models, or `auto` to select chat formatting when the tokenizer provides a
 template.
+
+Qwen2-family checkpoints must not use float16 on a Tesla T4. The runner uses
+float32 for Qwen on pre-Ampere CUDA devices and bfloat16 on supported newer
+GPUs when `--dtype auto` is selected. Explicit unstable Qwen/T4 float16 runs
+fail before model loading, and non-finite prefill logits abort the sample.

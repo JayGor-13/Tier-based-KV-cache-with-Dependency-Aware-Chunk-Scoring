@@ -1043,27 +1043,6 @@ def run_hf_grid(
                     )
                     raw_prompt_sha256 = _sha256_text(prompt)
                     prompt_sha256 = _sha256_text(prepared_prompt.rendered_text)
-                    report("  [fullkv] Generating baseline...")
-                    full_generation = generate_text(
-                        model=bundle.model,
-                        tokenizer=bundle.tokenizer,
-                        prompt=prompt,
-                        max_new_tokens=max_new_tokens,
-                        max_length=max_length,
-                        return_details=True,
-                        prepared_prompt=prepared_prompt,
-                    )
-                    prediction = full_generation.text
-                    report("  [fullkv] Baseline generation complete.")
-                    if gold is not None:
-                        baseline_qa_rows.append(
-                            {
-                                "prediction": prediction,
-                                "gold": gold,
-                                "dataset": spec.name,
-                            }
-                        )
-
                     report("  [prefill] Collecting blockwise attention and KV cache...")
                     prefill = run_hf_prefill(
                         model=bundle.model,
@@ -1098,6 +1077,27 @@ def run_hf_grid(
                             "prompt token IDs."
                         )
                     input_token_sha256 = _sha256_token_ids(input_token_ids)
+
+                    report("  [fullkv] Generating baseline...")
+                    full_generation = generate_text(
+                        model=bundle.model,
+                        tokenizer=bundle.tokenizer,
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        max_length=max_length,
+                        return_details=True,
+                        prepared_prompt=prepared_prompt,
+                    )
+                    prediction = full_generation.text
+                    report("  [fullkv] Baseline generation complete.")
+                    if gold is not None:
+                        baseline_qa_rows.append(
+                            {
+                                "prediction": prediction,
+                                "gold": gold,
+                                "dataset": spec.name,
+                            }
+                        )
                 except Exception as exc:
                     if not continue_on_error:
                         raise

@@ -250,6 +250,30 @@ def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypat
     assert tokenizer.tokenizer_calls[0][1]["add_special_tokens"] is False
 
 
+def test_prefill_rejects_non_finite_next_token_logits():
+    model = _model_for_family("qwen2")
+
+    def poison_logits(_module, _args, output):
+        output.logits.fill_(float("nan"))
+        return output
+
+    hook = model.register_forward_hook(poison_logits)
+    try:
+        with pytest.raises(FloatingPointError, match="non-finite next-token logits"):
+            run_hf_prefill(
+                model=model,
+                tokenizer=_TokenFixture(),
+                prompt="ignored",
+                sample_id="nonfinite",
+                observation_window=2,
+                min_chunk_tokens=1,
+                dependency_top_k=None,
+                prefill_block_size=8,
+            )
+    finally:
+        hook.remove()
+
+
 @pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])
 def test_compressed_cache_logits_match_independent_forward(family):
     model = _model_for_family(family)

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from src.models.cache_utils import prepare_prompt
+from src.models.cache_utils import prepare_prompt, resolve_model_torch_dtype
 
 
 class ChatTokenizerFixture:
@@ -98,3 +98,40 @@ def test_prepare_prompt_rejects_unknown_serialization():
             prompt="prompt",
             serialization="conversation",
         )
+
+
+def test_qwen_auto_dtype_uses_float32_on_t4_class_gpu():
+    assert resolve_model_torch_dtype(
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        "auto",
+        device=torch.device("cuda"),
+        cuda_capability=(7, 5),
+    ) == torch.float32
+
+
+def test_qwen_auto_dtype_uses_bfloat16_on_ampere_or_newer():
+    assert resolve_model_torch_dtype(
+        "Qwen/Qwen2-7B-Instruct",
+        "auto",
+        device=torch.device("cuda"),
+        cuda_capability=(8, 0),
+    ) == torch.bfloat16
+
+
+def test_qwen_float16_is_rejected_on_t4_class_gpu():
+    with pytest.raises(ValueError, match="numerically unstable"):
+        resolve_model_torch_dtype(
+            "Qwen/Qwen2.5-1.5B-Instruct",
+            "float16",
+            device=torch.device("cuda"),
+            cuda_capability=(7, 5),
+        )
+
+
+def test_non_qwen_float16_remains_available_on_t4_class_gpu():
+    assert resolve_model_torch_dtype(
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "float16",
+        device=torch.device("cuda"),
+        cuda_capability=(7, 5),
+    ) == torch.float16
