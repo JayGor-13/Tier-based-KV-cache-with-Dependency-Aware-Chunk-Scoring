@@ -114,3 +114,30 @@ python scripts/aggregate_hf_results.py \
   --input outputs/hf_smoke.json \
   --output outputs/hf_smoke_grouped.json
 ```
+
+## Paper-Aligned GSM8K Qualification
+
+`notebooks/gsm8k_step1_judging.ipynb` implements the eight-shot CoT prompt
+published in ChunkKV Appendix G, Table 30. It uses final numeric exact match,
+records normalized per-sample judgments, prompt and input-token hashes, generated
+token IDs, model revisions, and generation settings.
+
+The CLI selects this protocol inside the dataset specification:
+
+```bash
+python scripts/run_hf_grid.py \
+  --models Qwen/Qwen2.5-1.5B-Instruct \
+  --datasets "name=gsm8k_chunkkv,source=openai/gsm8k,adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,config=main,split=test,prompt_field=question,answer_field=answer" \
+  --methods fullkv \
+  --max-samples 10 \
+  --max-length 2048 \
+  --max-new-tokens 256 \
+  --fullkv-parity \
+  --require-fullkv-parity \
+  --output outputs/gsm8k_qualification.json
+```
+
+The parity control does not apply eviction. It compares ordinary HuggingFace
+FullKV generation with the same complete prefill cache decoded through the
+custom cache path. A fixed prompt-sized decode budget is not a valid parity
+control because it must begin evicting after generated tokens enter the cache.
