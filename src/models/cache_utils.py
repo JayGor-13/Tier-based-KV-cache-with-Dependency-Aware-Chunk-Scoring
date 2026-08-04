@@ -57,11 +57,20 @@ class HfPrefillRecord:
 
 
 @dataclass(frozen=True)
+class HfGenerationResult:
+    """Generated FullKV continuation and its exact token IDs."""
+
+    text: str
+    token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class EvictedGenerationResult:
     """Generated text plus bounded-cache diagnostics."""
 
     text: str
     cache_summary: dict[str, int]
+    token_ids: tuple[int, ...]
 
 
 def resolve_device(device: str | torch.device = "auto") -> torch.device:
@@ -571,10 +580,12 @@ def generate_text(
     prompt: str,
     max_new_tokens: int,
     max_length: int | None = None,
-) -> str:
+    return_details: bool = False,
+) -> str | HfGenerationResult:
     """Generate a deterministic continuation from the base HF model."""
     if max_new_tokens <= 0:
-        return ""
+        empty = HfGenerationResult(text="", token_ids=())
+        return empty if return_details else empty.text
 
     device = model_device(model)
     tokenizer_kwargs: dict[str, Any] = {"return_tensors": "pt"}
@@ -597,7 +608,12 @@ def generate_text(
 
     prompt_len = int(encoded["input_ids"].shape[1])
     continuation = generated[0, prompt_len:]
-    return tokenizer.decode(continuation, skip_special_tokens=True).strip()
+    token_ids = tuple(int(token_id) for token_id in continuation.detach().cpu().tolist())
+    result = HfGenerationResult(
+        text=tokenizer.decode(continuation, skip_special_tokens=True).strip(),
+        token_ids=token_ids,
+    )
+    return result if return_details else result.text
 
 
 @contextmanager
@@ -659,7 +675,7 @@ def generate_text_with_evicted_cache(
 ) -> str | EvictedGenerationResult:
     """Generate text dynamically using an already evicted KV cache."""
     if max_new_tokens <= 0:
-        empty_result = EvictedGenerationResult(text="", cache_summary={})
+        empty_result = EvictedGenerationResult(text="", cache_summary={}, token_ids=())
         return empty_result if return_details else empty_result.text
 
     device = model_device(model)
@@ -760,13 +776,18 @@ def generate_text_with_evicted_cache(
         text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
         cache_summary = cache_manager.summary() if cache_manager is not None else {}
         cache_summary["generated_tokens"] = len(generated_tokens)
-        result = EvictedGenerationResult(text=text, cache_summary=cache_summary)
+        result = EvictedGenerationResult(
+            text=text,
+            cache_summary=cache_summary,
+            token_ids=tuple(int(token_id) for token_id in generated_tokens),
+        )
         return result if return_details else result.text
 
 
 __all__ = [
     "HfModelBundle",
     "HfPrefillRecord",
+    "HfGenerationResult",
     "EvictedGenerationResult",
     "build_position_kwargs",
     "extended_rotary_position_capacity",

@@ -3,11 +3,16 @@ import torch
 
 transformers = pytest.importorskip("transformers")
 
+from benchmarks import hf_runner
+from benchmarks.gsm8k_protocol import CHUNKKV_GSM8K_8SHOT_PROTOCOL
 from src.core.evictor import evict_kv_cache
 from src.models.cache_utils import (
     EvictedGenerationResult,
+    HfModelBundle,
+    HfGenerationResult,
     build_position_kwargs,
     extended_rotary_position_capacity,
+    generate_text,
     generate_text_with_evicted_cache,
     run_hf_prefill,
 )
@@ -131,6 +136,91 @@ def _dynamic_cache(k_cache, v_cache):
             for layer_index in range(k_cache.shape[0])
         ]
     )
+
+
+@pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])
+def test_unpruned_custom_cache_generation_matches_fullkv_token_ids(family):
+    model = _model_for_family(family)
+    tokenizer = _TokenFixture()
+    fullkv = generate_text(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="ignored",
+        max_new_tokens=5,
+        max_length=32,
+        return_details=True,
+    )
+    prefill = _prefill(family)
+    cache_path = generate_text_with_evicted_cache(
+        model=model,
+        tokenizer=tokenizer,
+        first_new_token_id=prefill.next_token_id,
+        max_new_tokens=5,
+        k_cache=prefill.k_cache,
+        v_cache=prefill.v_cache,
+        original_sequence_length=prefill.sequence_length,
+        budget=None,
+        return_details=True,
+    )
+
+    assert isinstance(fullkv, HfGenerationResult)
+    assert isinstance(cache_path, EvictedGenerationResult)
+    assert cache_path.token_ids == fullkv.token_ids
+    assert cache_path.text == fullkv.text
+
+
+def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "gsm8k.jsonl"
+    dataset_path.write_text(
+        '{"id":"sample-1","question":"What is 2 + 2?","answer":"#### 4"}\n',
+        encoding="utf-8",
+    )
+    model = _model_for_family("qwen2")
+    tokenizer = _TokenFixture()
+    monkeypatch.setattr(
+        hf_runner,
+        "load_hf_model_and_tokenizer",
+        lambda *_args, **_kwargs: HfModelBundle(
+            model=model,
+            tokenizer=tokenizer,
+            device=torch.device("cpu"),
+        ),
+    )
+    spec = hf_runner.DatasetSpec(
+        name="gsm8k_chunkkv",
+        source=str(dataset_path),
+        adapter="gsm8k",
+        protocol=CHUNKKV_GSM8K_8SHOT_PROTOCOL,
+        prompt_field="question",
+        answer_field="answer",
+        id_field="id",
+    )
+
+    payload = hf_runner.run_hf_grid(
+        model_names=["tiny/qwen2"],
+        dataset_specs=[spec],
+        budgets=[],
+        budget_ratios=[],
+        thetas=[0.3],
+        recent_windows=[2],
+        alphas=[0.6],
+        methods=["fullkv"],
+        max_samples=1,
+        max_length=32,
+        max_new_tokens=3,
+        min_chunk_tokens=1,
+        run_fullkv_parity=True,
+    )
+
+    run = payload["runs"][0]
+    assert payload["protocols"]["gsm8k_chunkkv"]["shots"] == 8
+    assert payload["summary"]["fullkv_parity"]["all_passed"] is True
+    assert run["protocol"] == CHUNKKV_GSM8K_8SHOT_PROTOCOL
+    assert len(run["prompt_sha256"]) == 64
+    assert len(run["input_token_sha256"]) == 64
+    assert run["generated_token_ids"]
+    assert run["judgment"]["judge"] == "gsm8k_final_numeric_exact_match"
+    assert run["judgment"]["normalized_gold"] == "4"
 
 
 @pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])

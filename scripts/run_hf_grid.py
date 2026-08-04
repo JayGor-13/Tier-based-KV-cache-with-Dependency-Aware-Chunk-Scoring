@@ -83,6 +83,17 @@ def parse_args():
         default=True,
         help="Print live model, sample, prefill, and method progress",
     )
+    parser.add_argument(
+        "--fullkv-parity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compare HF FullKV generation with the unpruned custom-cache path",
+    )
+    parser.add_argument(
+        "--require-fullkv-parity",
+        action="store_true",
+        help="Exit nonzero after saving results unless every parity sample matches",
+    )
     
     parser.add_argument("--output", type=str, default="outputs/hf_grid_results.json", help="Output JSON path")
     return parser.parse_args()
@@ -128,12 +139,22 @@ def main():
         dtype=args.dtype,
         allow_level2_fallback=args.allow_level2_fallback,
         progress=args.progress,
+        run_fullkv_parity=(args.fullkv_parity or args.require_fullkv_parity),
     )
     
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"Results saved to {output_path}", flush=True)
+    if args.require_fullkv_parity:
+        parity = results["summary"]["fullkv_parity"]
+        if parity.get("all_passed") is not True:
+            print(
+                "FullKV parity requirement failed: "
+                f"{parity.get('mismatched_samples', [])}",
+                flush=True,
+            )
+            raise SystemExit(3)
 
 if __name__ == "__main__":
     main()
