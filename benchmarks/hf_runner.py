@@ -41,9 +41,10 @@ from src.core.evictor import EvictionResult, evict_kv_cache
 from src.core.masker import MaskerResult, assign_protection_tiers
 from src.core.scorer import DualSignalScorer
 from src.models.cache_utils import (
-    generate_text_with_evicted_cache,
     generate_text,
+    generate_text_with_evicted_cache,
     load_hf_model_and_tokenizer,
+    prepare_prompt,
     run_hf_prefill,
 )
 
@@ -930,6 +931,7 @@ def run_hf_grid(
     continue_on_error: bool = True,
     progress: bool = False,
     run_fullkv_parity: bool = False,
+    prompt_serialization: str = "auto",
 ) -> dict[str, Any]:
     """Run TDC-KV over all requested model/dataset/parameter combinations."""
     if not model_names:
@@ -957,6 +959,9 @@ def run_hf_grid(
         raise ValueError("max_budget_shortfall_tokens must be non-negative.")
     if run_fullkv_parity and max_new_tokens <= 0:
         raise ValueError("FullKV parity requires max_new_tokens to be positive.")
+    prompt_serialization = str(prompt_serialization).strip().lower()
+    if prompt_serialization not in {"auto", "raw", "chat"}:
+        raise ValueError("prompt_serialization must be `auto`, `raw`, or `chat`.")
     for spec in dataset_specs:
         protocol = canonicalize_protocol(spec.protocol)
         validate_protocol_for_adapter(protocol, spec.adapter)
@@ -1030,7 +1035,14 @@ def run_hf_grid(
                     prompt, gold = build_prompt_from_record(
                         record, spec, prompt_template=prompt_template
                     )
-                    prompt_sha256 = _sha256_text(prompt)
+                    prepared_prompt = prepare_prompt(
+                        tokenizer=bundle.tokenizer,
+                        prompt=prompt,
+                        max_length=max_length,
+                        serialization=prompt_serialization,
+                    )
+                    raw_prompt_sha256 = _sha256_text(prompt)
+                    prompt_sha256 = _sha256_text(prepared_prompt.rendered_text)
                     report("  [fullkv] Generating baseline...")
                     full_generation = generate_text(
                         model=bundle.model,
@@ -1039,6 +1051,7 @@ def run_hf_grid(
                         max_new_tokens=max_new_tokens,
                         max_length=max_length,
                         return_details=True,
+                        prepared_prompt=prepared_prompt,
                     )
                     prediction = full_generation.text
                     report("  [fullkv] Baseline generation complete.")
@@ -1066,6 +1079,7 @@ def run_hf_grid(
                         dependency_top_k=dependency_top_k,
                         prefill_block_size=prefill_block_size,
                         chunk_constructor=chunk_constructor,
+                        prepared_prompt=prepared_prompt,
                     )
                     report(
                         f"  [prefill] Complete: tokens={prefill.sequence_length} "
@@ -1074,6 +1088,15 @@ def run_hf_grid(
                     input_token_ids = tuple(
                         int(token_id) for token_id in prefill.input_ids.tolist()
                     )
+                    prepared_input_token_ids = tuple(
+                        int(token_id)
+                        for token_id in prepared_prompt.input_ids[0].tolist()
+                    )
+                    if input_token_ids != prepared_input_token_ids:
+                        raise RuntimeError(
+                            "FullKV and prefill did not consume the same prepared "
+                            "prompt token IDs."
+                        )
                     input_token_sha256 = _sha256_token_ids(input_token_ids)
                 except Exception as exc:
                     if not continue_on_error:
@@ -1111,6 +1134,8 @@ def run_hf_grid(
                         "dataset": spec.name,
                         "sample_id": sample_id,
                         "protocol": canonicalize_protocol(spec.protocol),
+                        "prompt_serialization": prepared_prompt.serialization,
+                        "raw_prompt_sha256": raw_prompt_sha256,
                         "prompt_sha256": prompt_sha256,
                         "input_token_sha256": input_token_sha256,
                         "fullkv_text": prediction,
@@ -1153,6 +1178,8 @@ def run_hf_grid(
                             "sample_id": sample_id,
                             "model_revision": model_revision,
                             "protocol": canonicalize_protocol(spec.protocol),
+                            "prompt_serialization": prepared_prompt.serialization,
+                            "raw_prompt_sha256": raw_prompt_sha256,
                             "prompt_sha256": prompt_sha256,
                             "input_token_sha256": input_token_sha256,
                             "config": {
@@ -1173,6 +1200,7 @@ def run_hf_grid(
                                 ),
                                 "prefill_block_size": int(prefill_block_size),
                                 "protocol": canonicalize_protocol(spec.protocol),
+                                "prompt_serialization": prepared_prompt.serialization,
                                 "max_length": max_length,
                                 "max_new_tokens": int(max_new_tokens),
                                 "do_sample": False,
@@ -1281,6 +1309,7 @@ def run_hf_grid(
                                 "prefill_block_size": int(prefill_block_size),
                                 "tier1_score_mode": tier1_score_mode,
                                 "protocol": canonicalize_protocol(spec.protocol),
+                                "prompt_serialization": prepared_prompt.serialization,
                                 "max_length": max_length,
                                 "max_new_tokens": int(max_new_tokens),
                                 "do_sample": False,
@@ -1399,6 +1428,8 @@ def run_hf_grid(
                                         "sample_id": sample_id,
                                         "model_revision": model_revision,
                                         "protocol": canonicalize_protocol(spec.protocol),
+                                        "prompt_serialization": prepared_prompt.serialization,
+                                        "raw_prompt_sha256": raw_prompt_sha256,
                                         "prompt_sha256": prompt_sha256,
                                         "input_token_sha256": input_token_sha256,
                                         "config": config,
@@ -1511,6 +1542,7 @@ def run_hf_grid(
             "tier1_score_mode": tier1_score_mode,
             "allow_level2_fallback": allow_level2_fallback,
             "run_fullkv_parity": run_fullkv_parity,
+            "prompt_serialization": prompt_serialization,
         },
         "summary": {
             "total_runs": len(runs),

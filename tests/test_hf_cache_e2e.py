@@ -36,6 +36,25 @@ class _TokenFixture:
         return " ".join(str(int(token_id)) for token_id in token_ids)
 
 
+class _ChatTokenFixture(_TokenFixture):
+    chat_template = "fixture-template"
+
+    def __init__(self):
+        self.template_calls = 0
+        self.tokenizer_calls = []
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert tokenize is False
+        assert add_generation_prompt is True
+        assert messages[0]["role"] == "user"
+        self.template_calls += 1
+        return f"<user>{messages[0]['content']}<assistant>"
+
+    def __call__(self, prompt, **kwargs):
+        self.tokenizer_calls.append((prompt, kwargs))
+        return super().__call__(prompt, **kwargs)
+
+
 _MODEL_CACHE = {}
 
 
@@ -176,7 +195,7 @@ def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypat
         encoding="utf-8",
     )
     model = _model_for_family("qwen2")
-    tokenizer = _TokenFixture()
+    tokenizer = _ChatTokenFixture()
     monkeypatch.setattr(
         hf_runner,
         "load_hf_model_and_tokenizer",
@@ -210,17 +229,25 @@ def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypat
         max_new_tokens=3,
         min_chunk_tokens=1,
         run_fullkv_parity=True,
+        prompt_serialization="chat",
     )
 
     run = payload["runs"][0]
     assert payload["protocols"]["gsm8k_chunkkv"]["shots"] == 8
     assert payload["summary"]["fullkv_parity"]["all_passed"] is True
     assert run["protocol"] == CHUNKKV_GSM8K_8SHOT_PROTOCOL
+    assert run["prompt_serialization"] == "chat"
+    assert run["config"]["prompt_serialization"] == "chat"
+    assert len(run["raw_prompt_sha256"]) == 64
     assert len(run["prompt_sha256"]) == 64
+    assert run["raw_prompt_sha256"] != run["prompt_sha256"]
     assert len(run["input_token_sha256"]) == 64
     assert run["generated_token_ids"]
     assert run["judgment"]["judge"] == "gsm8k_final_numeric_exact_match"
     assert run["judgment"]["normalized_gold"] == "4"
+    assert tokenizer.template_calls == 1
+    assert len(tokenizer.tokenizer_calls) == 1
+    assert tokenizer.tokenizer_calls[0][1]["add_special_tokens"] is False
 
 
 @pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])
