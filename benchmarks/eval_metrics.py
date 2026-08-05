@@ -217,16 +217,14 @@ def extract_final_answer(text: str) -> str:
     if boxed:
         text = boxed[-1]
 
-    numeric_text = text.replace("-$", "-").replace("$-", "-").replace("$", "")
-    numbers = _NUMBER_RE.findall(numeric_text)
+    numbers = _NUMBER_RE.findall(text)
     if numbers:
         return numbers[-1].replace(",", "")
 
     return text.strip().strip(".:;,$ ")
 
 
-def normalize_final_answer(text: str) -> str:
-    """Normalize a final numerical answer for auditable GSM8K judging."""
+def _normalize_final_answer(text: str) -> str:
     answer = extract_final_answer(text)
     if not answer:
         return ""
@@ -237,8 +235,6 @@ def normalize_final_answer(text: str) -> str:
     except InvalidOperation:
         return _normalize_answer(answer)
 
-    if numeric == 0:
-        return "0"
     normalized = format(numeric.normalize(), "f")
     if "." in normalized:
         normalized = normalized.rstrip("0").rstrip(".")
@@ -246,8 +242,8 @@ def normalize_final_answer(text: str) -> str:
 
 
 def final_answer_exact_match(prediction: str, gold: str) -> float:
-    pred = normalize_final_answer(prediction)
-    ref = normalize_final_answer(gold)
+    pred = _normalize_final_answer(prediction)
+    ref = _normalize_final_answer(gold)
     if not pred or not ref:
         return 0.0
     return float(pred == ref)
@@ -264,63 +260,6 @@ def final_answer_f1(prediction: str, gold: str) -> float:
 def gsm8k_accuracy(prediction: str, gold: str) -> float:
     """Score a GSM8K completion by its extracted final numeric answer."""
     return final_answer_exact_match(prediction, gold)
-
-
-def judge_gsm8k_prediction(
-    prediction: str,
-    gold: str,
-    *,
-    protocol: str,
-) -> dict:
-    """Return the complete per-sample record for GSM8K numerical judging."""
-    normalized_prediction = normalize_final_answer(prediction)
-    normalized_gold = normalize_final_answer(gold)
-    score = float(
-        bool(normalized_prediction)
-        and bool(normalized_gold)
-        and normalized_prediction == normalized_gold
-    )
-    return {
-        "judge": "gsm8k_final_numeric_exact_match",
-        "judge_version": 1,
-        "protocol": str(protocol),
-        "normalized_prediction": normalized_prediction,
-        "normalized_gold": normalized_gold,
-        "score": score,
-        "correct": bool(score),
-    }
-
-
-def summarize_generation_parity(records: list[dict]) -> dict:
-    """Summarize FullKV parity controls from per-sample comparison records."""
-    if not records:
-        return {
-            "count": 0,
-            "text_matches": 0,
-            "token_matches": 0,
-            "text_parity_rate": None,
-            "token_parity_rate": None,
-            "all_passed": None,
-            "mismatched_samples": [],
-        }
-
-    text_matches = sum(bool(record.get("text_match")) for record in records)
-    token_matches = sum(bool(record.get("token_match")) for record in records)
-    mismatched_samples = [
-        str(record.get("sample_id"))
-        for record in records
-        if not record.get("text_match") or not record.get("token_match")
-    ]
-    count = len(records)
-    return {
-        "count": count,
-        "text_matches": text_matches,
-        "token_matches": token_matches,
-        "text_parity_rate": text_matches / float(count),
-        "token_parity_rate": token_matches / float(count),
-        "all_passed": text_matches == count and token_matches == count,
-        "mismatched_samples": mismatched_samples,
-    }
 
 
 def niah_retrieval_match(prediction: str, gold: str) -> float:
@@ -753,10 +692,7 @@ __all__ = [
     "gsm8k_accuracy",
     "hotpotqa_exact_match",
     "hotpotqa_f1",
-    "judge_gsm8k_prediction",
     "niah_retrieval_match",
-    "normalize_final_answer",
-    "summarize_generation_parity",
     "summarize_cache_metrics",
     "summarize_qa",
     "token_f1",

@@ -6,10 +6,7 @@ from benchmarks.eval_metrics import (
     final_answer_exact_match,
     hotpotqa_exact_match,
     hotpotqa_f1,
-    judge_gsm8k_prediction,
     niah_retrieval_match,
-    normalize_final_answer,
-    summarize_generation_parity,
     summarize_qa,
     validate_budget_contract,
 )
@@ -26,54 +23,6 @@ def test_final_answer_exact_match_handles_commas_and_currency():
     gold = "Some reasoning.\n#### 1300"
 
     assert final_answer_exact_match(prediction, gold) == 1.0
-
-
-@pytest.mark.parametrize(
-    ("prediction", "normalized"),
-    [
-        ("The answer is $1,300.", "1300"),
-        ("The answer is -$12.50.", "-12.5"),
-        ("The answer is $-12.50.", "-12.5"),
-        ("The answer is -0.00.", "0"),
-    ],
-)
-def test_normalize_final_answer_handles_paper_reporting_formats(
-    prediction,
-    normalized,
-):
-    assert normalize_final_answer(prediction) == normalized
-
-
-def test_gsm8k_judgment_is_auditable():
-    judgment = judge_gsm8k_prediction(
-        "Reasoning. The answer is $1,300.",
-        "Gold reasoning.\n#### 1300",
-        protocol="chunkkv_gsm8k_8shot",
-    )
-
-    assert judgment == {
-        "judge": "gsm8k_final_numeric_exact_match",
-        "judge_version": 1,
-        "protocol": "chunkkv_gsm8k_8shot",
-        "normalized_prediction": "1300",
-        "normalized_gold": "1300",
-        "score": 1.0,
-        "correct": True,
-    }
-
-
-def test_generation_parity_summary_requires_text_and_token_matches():
-    summary = summarize_generation_parity(
-        [
-            {"sample_id": "a", "text_match": True, "token_match": True},
-            {"sample_id": "b", "text_match": True, "token_match": False},
-        ]
-    )
-
-    assert summary["text_parity_rate"] == 1.0
-    assert summary["token_parity_rate"] == 0.5
-    assert summary["all_passed"] is False
-    assert summary["mismatched_samples"] == ["b"]
 
 
 def test_summarize_qa_includes_gsm8k_final_answer_metrics():
