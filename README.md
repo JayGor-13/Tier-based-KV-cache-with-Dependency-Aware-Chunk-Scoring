@@ -137,7 +137,6 @@ python scripts/run_hf_grid.py \
   --max-samples 20 \
   --max-length 2048 \
   --max-new-tokens 256 \
-  --prompt-serialization chat \
   --fullkv-parity \
   --require-fullkv-parity \
   --output outputs/gsm8k_qualification.json
@@ -147,7 +146,3 @@ The parity control does not apply eviction. It compares ordinary HuggingFace
 FullKV generation with the same complete prefill cache decoded through the
 custom cache path. A fixed prompt-sized decode budget is not a valid parity
 control because it must begin evicting after generated tokens enter the cache.
-The prompt is serialized and tokenized once; FullKV and cache prefill consume
-the same token tensors. Use `chat` for instruction checkpoints, `raw` for base
-models, or `auto` to select chat formatting when the tokenizer provides a
-template.
