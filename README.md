@@ -122,19 +122,14 @@ published in ChunkKV Appendix G, Table 30. It uses final numeric exact match,
 records normalized per-sample judgments, prompt and input-token hashes, generated
 token IDs, model revisions, and generation settings.
 
-The notebook first uses Qwen2.5-1.5B-Instruct on a T4 as an engineering smoke
-test. Its task accuracy is diagnostic only; it is not a paper-quality FullKV
-baseline. ChunkKV reports Qwen2-7B-Instruct for its Qwen GSM8K comparison, so
-the qualification and compression stages use that checkpoint on an L4 or A100.
-
-The CLI selects the paper protocol inside the dataset specification:
+The CLI selects this protocol inside the dataset specification:
 
 ```bash
 python scripts/run_hf_grid.py \
-  --models Qwen/Qwen2-7B-Instruct \
+  --models Qwen/Qwen2.5-1.5B-Instruct \
   --datasets "name=gsm8k_chunkkv,source=openai/gsm8k,adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,config=main,split=test,prompt_field=question,answer_field=answer" \
   --methods fullkv \
-  --max-samples 20 \
+  --max-samples 10 \
   --max-length 2048 \
   --max-new-tokens 256 \
   --fullkv-parity \
