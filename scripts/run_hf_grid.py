@@ -69,12 +69,6 @@ def parse_args():
     parser.add_argument("--max-samples", type=int, default=10, help="Max samples per dataset")
     parser.add_argument("--max-length", type=int, default=2048, help="Max total sequence length")
     parser.add_argument("--max-new-tokens", type=int, default=50, help="Max new tokens to generate")
-    parser.add_argument(
-        "--prompt-serialization",
-        choices=("auto", "raw", "chat"),
-        default="auto",
-        help="Model prompt formatting; auto uses a tokenizer chat template when available",
-    )
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
     parser.add_argument("--dtype", type=str, default="auto", help="Torch dtype")
     parser.add_argument(
@@ -146,7 +140,6 @@ def main():
         allow_level2_fallback=args.allow_level2_fallback,
         progress=args.progress,
         run_fullkv_parity=(args.fullkv_parity or args.require_fullkv_parity),
-        prompt_serialization=args.prompt_serialization,
     )
     
     output_path = Path(args.output)
