@@ -11,7 +11,6 @@ from benchmarks.hf_runner import (
     run_hf_grid,
     _run_eviction_method,
 )
-from benchmarks.gsm8k_protocol import CHUNKKV_GSM8K_8SHOT_PROTOCOL
 
 
 def test_parse_dataset_spec_infers_official_gsm8k_defaults():
@@ -40,32 +39,6 @@ def test_gsm8k_adapter_builds_task_prompt_with_final_answer_contract():
     assert "Question: There are 2 bags with 3 apples each." in prompt
     assert "#### <number>" in prompt
     assert gold == "Each bag has 3 apples, so 2 * 3 = <<2*3=6>>6.\n#### 6"
-
-
-def test_chunkkv_gsm8k_protocol_builds_exact_eight_shot_prompt():
-    spec = parse_dataset_spec("source=gsm8k,protocol=gsm8k_chunkkv")
-    prompt, gold = build_prompt_from_record(
-        {
-            "question": "There are 2 bags with 3 apples each. How many apples?",
-            "answer": "Reasoning.\n#### 6",
-        },
-        spec,
-    )
-
-    assert spec.protocol == CHUNKKV_GSM8K_8SHOT_PROTOCOL
-    assert prompt.count("Question:") == 9
-    assert prompt.count("The answer is") == 8
-    assert prompt.endswith(
-        "Question: There are 2 bags with 3 apples each. How many apples?\n"
-    )
-    assert gold == "Reasoning.\n#### 6"
-
-
-def test_paper_protocol_rejects_custom_prompt_templates():
-    with pytest.raises(ValueError, match="cannot be combined"):
-        parse_dataset_spec(
-            "source=gsm8k,protocol=gsm8k_chunkkv,template={prompt}"
-        )
 
 
 def test_hotpotqa_adapter_includes_context_and_exposes_supporting_facts_for_templates():

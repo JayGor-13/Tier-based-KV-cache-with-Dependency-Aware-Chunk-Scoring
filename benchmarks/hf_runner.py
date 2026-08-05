@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import time
@@ -18,19 +17,9 @@ from benchmarks.eval_metrics import (
     CacheMetrics,
     aggregate_grouped_runs,
     compute_cache_metrics,
-    judge_gsm8k_prediction,
-    summarize_generation_parity,
     summarize_cache_metrics,
     summarize_qa,
     validate_budget_contract,
-)
-from benchmarks.gsm8k_protocol import (
-    CHUNKKV_GSM8K_8SHOT_PROTOCOL,
-    DEFAULT_PROTOCOL,
-    build_chunkkv_gsm8k_prompt,
-    canonicalize_protocol,
-    protocol_metadata,
-    validate_protocol_for_adapter,
 )
 from src.baselines.chunkkv import evict_chunkkv
 from src.baselines.h2o import evict_h2o
@@ -71,7 +60,6 @@ class DatasetSpec:
     id_field: str | None = None
     prompt_template: str | None = None
     adapter: str | None = None
-    protocol: str = DEFAULT_PROTOCOL
     options: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -119,18 +107,11 @@ def parse_dataset_spec(text: str) -> DatasetSpec:
         "path",
         "prompt",
         "prompt_field",
-        "protocol",
         "source",
         "split",
         "task",
         "template",
     }
-    protocol = canonicalize_protocol(raw.get("protocol"))
-    validate_protocol_for_adapter(protocol, adapter)
-    if protocol != DEFAULT_PROTOCOL and raw.get("template"):
-        raise ValueError(
-            "Paper evaluation protocols cannot be combined with a custom template."
-        )
     return DatasetSpec(
         name=raw.get("name", default_name),
         source=source,
@@ -141,7 +122,6 @@ def parse_dataset_spec(text: str) -> DatasetSpec:
         id_field=raw.get("id_field", raw.get("id", defaults.get("id_field"))),
         prompt_template=raw.get("template"),
         adapter=adapter,
-        protocol=protocol,
         options={key: value for key, value in raw.items() if key not in reserved},
     )
 
@@ -477,17 +457,9 @@ def build_prompt_from_record(
     gold = _answer_to_text(_get_nested(record, spec.answer_field))
     values = _record_format_values(record, spec, prompt_value, gold)
 
-    protocol = canonicalize_protocol(spec.protocol)
-    validate_protocol_for_adapter(protocol, spec.adapter)
     template = prompt_template or spec.prompt_template
-    if protocol != DEFAULT_PROTOCOL and template:
-        raise ValueError(
-            "Paper evaluation protocols cannot be combined with a custom template."
-        )
     if template:
         return _format_with_template(template, values), gold
-    if protocol == CHUNKKV_GSM8K_8SHOT_PROTOCOL:
-        return build_chunkkv_gsm8k_prompt(str(prompt_value)), gold
     if spec.adapter == "gsm8k":
         return _build_gsm8k_prompt(values), gold
     if spec.adapter == "hotpotqa":
@@ -683,42 +655,6 @@ def _chunk_size_metrics(chunks: list[torch.Tensor]) -> dict[str, int | float]:
         "max_chunk_size": max(sizes),
         "avg_chunk_size": sum(sizes) / float(len(sizes)),
     }
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
-
-
-def _sha256_token_ids(token_ids: Iterable[int]) -> str:
-    serialized = json.dumps(
-        [int(token_id) for token_id in token_ids],
-        separators=(",", ":"),
-    )
-    return _sha256_text(serialized)
-
-
-def _model_revision(bundle: Any) -> str | None:
-    candidates = [
-        getattr(getattr(bundle.model, "config", None), "_commit_hash", None),
-        getattr(bundle.tokenizer, "init_kwargs", {}).get("_commit_hash"),
-    ]
-    return next((str(value) for value in candidates if value), None)
-
-
-def _judge_prediction(
-    spec: DatasetSpec,
-    prediction: str,
-    gold: str | None,
-) -> dict | None:
-    if gold is None:
-        return None
-    if spec.adapter == "gsm8k":
-        return judge_gsm8k_prediction(
-            prediction,
-            gold,
-            protocol=canonicalize_protocol(spec.protocol),
-        )
-    return None
 
 
 def normalize_methods(methods: Iterable[str] | None) -> list[str]:
@@ -929,7 +865,6 @@ def run_hf_grid(
     allow_level2_fallback: bool = True,
     continue_on_error: bool = True,
     progress: bool = False,
-    run_fullkv_parity: bool = False,
 ) -> dict[str, Any]:
     """Run TDC-KV over all requested model/dataset/parameter combinations."""
     if not model_names:
@@ -955,15 +890,6 @@ def run_hf_grid(
         raise ValueError("min_budget_utilization must be in [0, 1].")
     if max_budget_shortfall_tokens < 0:
         raise ValueError("max_budget_shortfall_tokens must be non-negative.")
-    if run_fullkv_parity and max_new_tokens <= 0:
-        raise ValueError("FullKV parity requires max_new_tokens to be positive.")
-    for spec in dataset_specs:
-        protocol = canonicalize_protocol(spec.protocol)
-        validate_protocol_for_adapter(protocol, spec.adapter)
-        if protocol != DEFAULT_PROTOCOL and (prompt_template or spec.prompt_template):
-            raise ValueError(
-                "Paper evaluation protocols cannot be combined with a custom template."
-            )
     experiment_methods = normalize_methods(methods)
     tier1_score_mode = tier1_score_mode.strip().lower()
     if tier1_score_mode not in {"dependency", "fused", "none"}:
@@ -989,8 +915,6 @@ def run_hf_grid(
     }
     baseline_qa_rows: list[dict[str, str]] = []
     evicted_qa_rows: list[dict[str, str]] = []
-    parity_records: list[dict[str, Any]] = []
-    model_revisions: dict[str, str | None] = {}
     max_observation_window = max(int(window) for window in recent_windows)
 
     def report(message: str) -> None:
@@ -1006,8 +930,6 @@ def run_hf_grid(
             trust_remote_code=trust_remote_code,
             attn_implementation=attn_implementation,
         )
-        model_revision = _model_revision(bundle)
-        model_revisions[model_name] = model_revision
         report(f"[model] Loaded {model_name}.")
         chunk_constructor = SentenceBoundaryChunkConstructor(
             tokenizer=bundle.tokenizer,
@@ -1030,17 +952,14 @@ def run_hf_grid(
                     prompt, gold = build_prompt_from_record(
                         record, spec, prompt_template=prompt_template
                     )
-                    prompt_sha256 = _sha256_text(prompt)
                     report("  [fullkv] Generating baseline...")
-                    full_generation = generate_text(
+                    prediction = generate_text(
                         model=bundle.model,
                         tokenizer=bundle.tokenizer,
                         prompt=prompt,
                         max_new_tokens=max_new_tokens,
                         max_length=max_length,
-                        return_details=True,
                     )
-                    prediction = full_generation.text
                     report("  [fullkv] Baseline generation complete.")
                     if gold is not None:
                         baseline_qa_rows.append(
@@ -1071,10 +990,6 @@ def run_hf_grid(
                         f"  [prefill] Complete: tokens={prefill.sequence_length} "
                         f"blocks={prefill.prefill_blocks} chunks={len(prefill.chunks)}"
                     )
-                    input_token_ids = tuple(
-                        int(token_id) for token_id in prefill.input_ids.tolist()
-                    )
-                    input_token_sha256 = _sha256_token_ids(input_token_ids)
                 except Exception as exc:
                     if not continue_on_error:
                         raise
@@ -1088,49 +1003,7 @@ def run_hf_grid(
                     )
                     continue
 
-                if run_fullkv_parity:
-                    if prefill.next_token_id is None:
-                        raise RuntimeError(
-                            "FullKV parity requires a prefill next-token prediction."
-                        )
-                    report("  [parity] Running unpruned custom-cache generation...")
-                    parity_generation = generate_text_with_evicted_cache(
-                        model=bundle.model,
-                        tokenizer=bundle.tokenizer,
-                        first_new_token_id=int(prefill.next_token_id),
-                        max_new_tokens=max_new_tokens,
-                        k_cache=prefill.k_cache,
-                        v_cache=prefill.v_cache,
-                        original_sequence_length=prefill.sequence_length,
-                        budget=None,
-                        return_details=True,
-                    )
-                    parity_record = {
-                        "model": model_name,
-                        "model_revision": model_revision,
-                        "dataset": spec.name,
-                        "sample_id": sample_id,
-                        "protocol": canonicalize_protocol(spec.protocol),
-                        "prompt_sha256": prompt_sha256,
-                        "input_token_sha256": input_token_sha256,
-                        "fullkv_text": prediction,
-                        "cache_path_text": parity_generation.text,
-                        "fullkv_token_ids": list(full_generation.token_ids),
-                        "cache_path_token_ids": list(parity_generation.token_ids),
-                        "text_match": prediction == parity_generation.text,
-                        "token_match": (
-                            full_generation.token_ids == parity_generation.token_ids
-                        ),
-                    }
-                    parity_records.append(parity_record)
-                    report(
-                        "  [parity] "
-                        f"text_match={parity_record['text_match']} "
-                        f"token_match={parity_record['token_match']}"
-                    )
-
                 chunk_size_metrics = _chunk_size_metrics(prefill.chunks)
-                full_judgment = _judge_prediction(spec, prediction, gold)
                 if "fullkv" in experiment_methods:
                     full_metrics = compute_cache_metrics(
                         sample_id=sample_id,
@@ -1151,10 +1024,6 @@ def run_hf_grid(
                             "model": model_name,
                             "dataset": spec.name,
                             "sample_id": sample_id,
-                            "model_revision": model_revision,
-                            "protocol": canonicalize_protocol(spec.protocol),
-                            "prompt_sha256": prompt_sha256,
-                            "input_token_sha256": input_token_sha256,
                             "config": {
                                 "method": "fullkv",
                                 "budget": prefill.sequence_length,
@@ -1172,10 +1041,6 @@ def run_hf_grid(
                                     max_budget_shortfall_tokens
                                 ),
                                 "prefill_block_size": int(prefill_block_size),
-                                "protocol": canonicalize_protocol(spec.protocol),
-                                "max_length": max_length,
-                                "max_new_tokens": int(max_new_tokens),
-                                "do_sample": False,
                             },
                             "sequence_length": prefill.sequence_length,
                             "prefill_blocks": prefill.prefill_blocks,
@@ -1188,9 +1053,7 @@ def run_hf_grid(
                             "metrics": full_metrics.to_dict(),
                             "prediction": prediction,
                             "evicted_prediction": prediction,
-                            "generated_token_ids": list(full_generation.token_ids),
                             "gold": gold,
-                            "judgment": full_judgment,
                         }
                     )
 
@@ -1280,10 +1143,6 @@ def run_hf_grid(
                                 ),
                                 "prefill_block_size": int(prefill_block_size),
                                 "tier1_score_mode": tier1_score_mode,
-                                "protocol": canonicalize_protocol(spec.protocol),
-                                "max_length": max_length,
-                                "max_new_tokens": int(max_new_tokens),
-                                "do_sample": False,
                             }
                             try:
                                 run_started = time.perf_counter()
@@ -1355,24 +1214,12 @@ def run_hf_grid(
                                         return_details=True,
                                     )
                                     evicted_prediction = generation_result.text
-                                    generated_token_ids = list(
-                                        generation_result.token_ids
-                                    )
                                     decode_cache_summary = (
                                         generation_result.cache_summary
                                     )
                                 else:
                                     evicted_prediction = prediction
-                                    generated_token_ids = list(
-                                        full_generation.token_ids
-                                    )
                                     decode_cache_summary = None
-
-                                judgment = _judge_prediction(
-                                    spec,
-                                    evicted_prediction,
-                                    gold,
-                                )
 
                                 _append_method_quality(
                                     method_qa_rows,
@@ -1397,10 +1244,6 @@ def run_hf_grid(
                                         "model": model_name,
                                         "dataset": spec.name,
                                         "sample_id": sample_id,
-                                        "model_revision": model_revision,
-                                        "protocol": canonicalize_protocol(spec.protocol),
-                                        "prompt_sha256": prompt_sha256,
-                                        "input_token_sha256": input_token_sha256,
                                         "config": config,
                                         "sequence_length": prefill.sequence_length,
                                         "prefill_blocks": prefill.prefill_blocks,
@@ -1454,9 +1297,7 @@ def run_hf_grid(
                                         "metrics": metrics.to_dict(),
                                         "prediction": prediction,
                                         "evicted_prediction": evicted_prediction,
-                                        "generated_token_ids": generated_token_ids,
                                         "gold": gold,
-                                        "judgment": judgment,
                                     }
                                 )
                                 report(
@@ -1484,11 +1325,7 @@ def run_hf_grid(
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "models": model_names,
-        "model_revisions": model_revisions,
         "datasets": [spec.to_dict() for spec in dataset_specs],
-        "protocols": {
-            spec.name: protocol_metadata(spec.protocol) for spec in dataset_specs
-        },
         "grid": {
             "methods": experiment_methods,
             "budgets": budgets,
@@ -1510,7 +1347,6 @@ def run_hf_grid(
             "prefill_block_size": prefill_block_size,
             "tier1_score_mode": tier1_score_mode,
             "allow_level2_fallback": allow_level2_fallback,
-            "run_fullkv_parity": run_fullkv_parity,
         },
         "summary": {
             "total_runs": len(runs),
@@ -1520,7 +1356,6 @@ def run_hf_grid(
             "cache_summary": summarize_cache_metrics(metric_rows),
             "baseline_qa_summary": summarize_qa(baseline_qa_rows),
             "evicted_qa_summary": summarize_qa(evicted_qa_rows),
-            "fullkv_parity": summarize_generation_parity(parity_records),
             "method_summaries": {
                 method: {
                     "cache_summary": summarize_cache_metrics(
@@ -1532,7 +1367,6 @@ def run_hf_grid(
             },
         },
         "grouped_results": grouped_results,
-        "parity_records": parity_records,
         "runs": runs,
     }
 
