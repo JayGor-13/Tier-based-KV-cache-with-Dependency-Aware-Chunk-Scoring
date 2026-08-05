@@ -118,40 +118,6 @@ def resolve_torch_dtype(
     raise ValueError(f"Unsupported dtype `{dtype}`.")
 
 
-def resolve_model_torch_dtype(
-    model_name: str,
-    dtype: str,
-    *,
-    device: torch.device,
-    cuda_capability: tuple[int, int] | None = None,
-) -> torch.dtype | None:
-    """Resolve a model-aware dtype and reject known unstable combinations."""
-    requested = str(dtype).lower()
-    resolved = resolve_torch_dtype(requested, device=device)
-    normalized_model = str(model_name).lower()
-    is_qwen2_family = "qwen2" in normalized_model
-
-    if device.type != "cuda" or not is_qwen2_family:
-        return resolved
-
-    capability = cuda_capability
-    if capability is None and torch.cuda.is_available():
-        capability = torch.cuda.get_device_capability(device)
-
-    if requested == "auto":
-        if capability is not None and capability[0] >= 8:
-            return torch.bfloat16
-        return torch.float32
-
-    if resolved == torch.float16 and capability is not None and capability[0] < 8:
-        raise ValueError(
-            "Qwen2-family float16 inference is numerically unstable on this GPU "
-            f"(compute capability {capability[0]}.{capability[1]}). Use float32 "
-            "on a T4-class GPU or bfloat16 on an Ampere-or-newer GPU."
-        )
-    return resolved
-
-
 def load_hf_model_and_tokenizer(
     model_name: str,
     *,
@@ -174,11 +140,7 @@ def load_hf_model_and_tokenizer(
         ) from exc
 
     device_obj = resolve_device(device)
-    torch_dtype = resolve_model_torch_dtype(
-        model_name,
-        dtype,
-        device=device_obj,
-    )
+    torch_dtype = resolve_torch_dtype(dtype, device=device_obj)
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, trust_remote_code=trust_remote_code
@@ -655,15 +617,7 @@ def run_hf_prefill(
 
             past_key_values = outputs.past_key_values
             if outputs.logits is not None:
-                next_token_logits = outputs.logits[0, -1, :]
-                if not torch.isfinite(next_token_logits).all():
-                    finite_count = int(torch.isfinite(next_token_logits).sum().item())
-                    raise FloatingPointError(
-                        "Model prefill produced non-finite next-token logits "
-                        f"({finite_count}/{next_token_logits.numel()} finite). "
-                        "Change the model dtype before generating results."
-                    )
-                next_token_id = int(torch.argmax(next_token_logits).item())
+                next_token_id = int(torch.argmax(outputs.logits[0, -1, :]).item())
             prefill_blocks += 1
             if graph_builder is not None:
                 del graph_rows
