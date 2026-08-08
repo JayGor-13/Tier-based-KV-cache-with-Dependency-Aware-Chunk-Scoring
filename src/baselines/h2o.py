@@ -49,6 +49,7 @@ def evict_h2o(
     recent_window: int = 16,
     sink_tokens: int = 1,
     heavy_hitter_ratio: float = 1.0,
+    token_scores: torch.Tensor | None = None,
 ) -> EvictionResult:
     """Evict using H2O-style policy.
 
@@ -68,7 +69,11 @@ def evict_h2o(
             keep_mask=keep_all, k_cache=k_cache, v_cache=v_cache, budget=budget
         )
 
-    scores = h2o_token_scores(attention_obs).to(device=k_cache.device)
+    scores = (
+        h2o_token_scores(attention_obs)
+        if token_scores is None
+        else token_scores.to(dtype=torch.float32)
+    ).to(device=k_cache.device)
     if scores.numel() != t:
         raise ValueError(
             f"attention_obs token axis ({scores.numel()}) does not match cache length ({t})."

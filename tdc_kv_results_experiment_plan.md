@@ -14,6 +14,23 @@ Papers used:
 - KVpop: learned fixed-budget predictive online pruning using future-attention supervision.
 - Understanding the Physics of KV Cache Compression: reachability-aware evaluation, Global Eviction Ratio, head consensus, and safety-cliff analysis.
 
+## Phase-1 Implementation Status (2026-08-05)
+
+Implemented and regression-tested:
+
+- exact one-time prompt serialization, prompt/token hashes, and a ChunkKV-style
+  GSM8K eight-shot protocol;
+- FullKV versus unpruned custom-cache generation parity;
+- fair method-specific scoring and a common compressed decode policy;
+- synchronized stage timing, peak CUDA memory, throughput, environment/Git
+  provenance, deterministic run fingerprints, and atomic checkpoint/resume;
+- a hard paper-qualification gate for errors, parity, non-empty outputs,
+  measurements, CUDA availability, and matched budgets.
+
+Still belongs to later phases: official external baseline integrations,
+evidence/GER structural metrics, full 7B/8B GPU qualification, final dataset
+runs, statistical analysis, figures, and paper tables.
+
 ## 1. Core Claim To Prove
 
 TDC-KV should be evaluated as a training-free, chunk-level, tier-protected KV cache eviction method that preserves semantic and dependency structure better than token-only pruning under matched KV budgets.

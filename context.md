@@ -1,6 +1,6 @@
 # TDC-KV Repo Context
 
-Last maintained: 2026-07-30
+Last maintained: 2026-08-05
 
 ## Purpose
 
@@ -49,6 +49,19 @@ eviction with dependency-aware chunk scoring. The design details live in
      experiment entry points.
    - Baselines implemented: ChunkKV, SnapKV, and H2O-style observed-attention
      heavy hitters.
+
+6. Phase-1 paper qualification layer
+   - Uses one-time raw/chat prompt serialization and records prompt/token hashes.
+   - Includes the ChunkKV-compatible GSM8K eight-shot protocol and numeric judge.
+   - Checks exact FullKV/custom-cache token parity before qualified experiments.
+   - Separates model load, generation, prefill, scoring, policy, and decode timing;
+     CUDA runs also record peak allocated and reserved VRAM.
+   - Uses precomputed H2O/SnapKV scores, independent direct-attention ChunkKV
+     scores, and a common decode policy for fair method comparisons.
+   - Records Python/package/CUDA/GPU/Git provenance and a deterministic grid
+     fingerprint.
+   - Writes atomic per-run checkpoints and resumes only a matching experiment.
+   - Exposes `--require-qualified --require-cuda` as the final-run hard gate.
 
 ## Fixed Issues
 
@@ -121,3 +134,9 @@ after smoke checks.
   deliberate state-management decision.
 - Layer weighting in Module 2 is implemented as a scoring hypothesis. The spec
   notes that the empirical validation is still pending.
+- The local StreamingLLM, H2O, SnapKV, and ChunkKV policies are fair,
+  matched-budget approximations, not vendored official reference repositories.
+- The ordinary FP16/BF16 eager-attention loader is intentionally the paper
+  correctness path. It does not make 7B/8B models fit the laptop RTX 4050 6 GB;
+  large-model qualification and final runs require a verified A100-class Colab
+  runtime. Quantized execution would be a separate experimental condition.

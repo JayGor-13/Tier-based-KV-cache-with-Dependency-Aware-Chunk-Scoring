@@ -93,6 +93,60 @@ attention tensors. Result JSON records the configured size and actual block coun
 Long HuggingFace runs print live model, sample, prefill, and method/budget
 progress by default. Pass `--no-progress` only when quiet output is required.
 
+## Paper Qualification Workflow
+
+Phase 1 adds a strict experiment path on top of the exploratory runner:
+
+- prompts are serialized exactly once (`raw`, `chat`, or `auto`) and their raw,
+  serialized, and token-id SHA-256 hashes are stored;
+- the optional FullKV parity check compares HuggingFace generation with the
+  unpruned custom-cache path on the exact same input token ids;
+- FullKV generation, prefill, scoring, policy selection, and decode are timed
+  separately with CUDA synchronization and peak allocated/reserved VRAM;
+- H2O and SnapKV scores are computed once and passed into eviction, while
+  ChunkKV uses direct attention scores independently of TDC-KV dependency
+  routing;
+- `common_streaming` applies one decode-cache policy to all compressed methods;
+- every successful row has a deterministic run key, and an atomic checkpoint is
+  updated after every completed row;
+- the qualification gate rejects failed rows, parity failures, empty
+  generations, missing measurements, and matched-budget violations.
+
+Use the local RTX 4050 (6 GB) for tests and a small-model qualification run:
+
+```bash
+python scripts/run_hf_grid.py \
+  --models Qwen/Qwen2.5-0.5B-Instruct \
+  --datasets "name=gsm8k,source=openai/gsm8k,config=main,split=test,adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,prompt_field=question,answer_field=answer" \
+  --methods fullkv,streamingllm,h2o,snapkv,chunkkv,tdc_kv \
+  --budget-ratios 0.5 \
+  --max-samples 2 \
+  --max-length 1024 \
+  --max-new-tokens 64 \
+  --prefill-block-size 32 \
+  --dtype float16 \
+  --decode-policy common_streaming \
+  --prompt-serialization chat \
+  --checkpoint outputs/phase1_local.checkpoint.json \
+  --require-qualified --require-cuda \
+  --output outputs/phase1_local.json
+```
+
+Resume the exact grid after interruption by adding `--resume` with the same
+arguments. A changed model, dataset, seed, protocol, or grid is rejected rather
+than mixed into an existing checkpoint.
+
+The current loader uses ordinary FP16/BF16 weights and eager attention because
+attention tensors are required for scoring. A 7B/8B model therefore does not
+fit the 6 GB laptop GPU. Run those paper experiments on a Colab Pro session only
+after confirming an A100-class runtime (preferably 40 GB or more); Colab Pro
+does not guarantee a particular GPU. Keep `--prefill-block-size 32` for the
+first 7B/8B smoke and increase it only after inspecting recorded peak VRAM.
+
+The local StreamingLLM, H2O, SnapKV, and ChunkKV implementations are explicitly
+tagged as `approximation` in `grid.method_metadata`. Do not describe them as
+bit-for-bit official reference implementations in the paper.
+
 For staged Colab execution, use `notebooks/tdc_kv_actual_testing.ipynb`. It
 verifies `branch-h`, CUDA, focused end-to-end tests, and one-sample smoke runs
 before exposing the larger GSM8K, NIAH, and HotpotQA pilot cells. Each run has
