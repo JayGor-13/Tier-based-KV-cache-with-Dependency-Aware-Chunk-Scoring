@@ -1,13 +1,20 @@
+import json
+
 import pytest
 import torch
 
 transformers = pytest.importorskip("transformers")
 
+from benchmarks import hf_runner
+from benchmarks.gsm8k_protocol import CHUNKKV_GSM8K_8SHOT_PROTOCOL
 from src.core.evictor import evict_kv_cache
 from src.models.cache_utils import (
     EvictedGenerationResult,
+    HfModelBundle,
+    HfGenerationResult,
     build_position_kwargs,
     extended_rotary_position_capacity,
+    generate_text,
     generate_text_with_evicted_cache,
     run_hf_prefill,
 )
@@ -29,6 +36,25 @@ class _TokenFixture:
     def decode(self, token_ids, skip_special_tokens=True):
         del skip_special_tokens
         return " ".join(str(int(token_id)) for token_id in token_ids)
+
+
+class _ChatTokenFixture(_TokenFixture):
+    chat_template = "fixture-template"
+
+    def __init__(self):
+        self.template_calls = 0
+        self.tokenizer_calls = []
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert tokenize is False
+        assert add_generation_prompt is True
+        assert messages[0]["role"] == "user"
+        self.template_calls += 1
+        return f"<user>{messages[0]['content']}<assistant>"
+
+    def __call__(self, prompt, **kwargs):
+        self.tokenizer_calls.append((prompt, kwargs))
+        return super().__call__(prompt, **kwargs)
 
 
 _MODEL_CACHE = {}
@@ -131,6 +157,194 @@ def _dynamic_cache(k_cache, v_cache):
             for layer_index in range(k_cache.shape[0])
         ]
     )
+
+
+@pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])
+def test_unpruned_custom_cache_generation_matches_fullkv_token_ids(family):
+    model = _model_for_family(family)
+    tokenizer = _TokenFixture()
+    fullkv = generate_text(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="ignored",
+        max_new_tokens=5,
+        max_length=32,
+        return_details=True,
+    )
+    prefill = _prefill(family)
+    cache_path = generate_text_with_evicted_cache(
+        model=model,
+        tokenizer=tokenizer,
+        first_new_token_id=prefill.next_token_id,
+        max_new_tokens=5,
+        k_cache=prefill.k_cache,
+        v_cache=prefill.v_cache,
+        original_sequence_length=prefill.sequence_length,
+        budget=None,
+        return_details=True,
+    )
+
+    assert isinstance(fullkv, HfGenerationResult)
+    assert isinstance(cache_path, EvictedGenerationResult)
+    assert cache_path.token_ids == fullkv.token_ids
+    assert cache_path.text == fullkv.text
+
+
+def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "gsm8k.jsonl"
+    dataset_path.write_text(
+        '{"id":"sample-1","question":"What is 2 + 2?","answer":"#### 4"}\n',
+        encoding="utf-8",
+    )
+    model = _model_for_family("qwen2")
+    tokenizer = _ChatTokenFixture()
+    monkeypatch.setattr(
+        hf_runner,
+        "load_hf_model_and_tokenizer",
+        lambda *_args, **_kwargs: HfModelBundle(
+            model=model,
+            tokenizer=tokenizer,
+            device=torch.device("cpu"),
+        ),
+    )
+    spec = hf_runner.DatasetSpec(
+        name="gsm8k_chunkkv",
+        source=str(dataset_path),
+        adapter="gsm8k",
+        protocol=CHUNKKV_GSM8K_8SHOT_PROTOCOL,
+        prompt_field="question",
+        answer_field="answer",
+        id_field="id",
+    )
+
+    payload = hf_runner.run_hf_grid(
+        model_names=["tiny/qwen2"],
+        dataset_specs=[spec],
+        budgets=[],
+        budget_ratios=[],
+        thetas=[0.3],
+        recent_windows=[2],
+        alphas=[0.6],
+        methods=["fullkv"],
+        max_samples=1,
+        max_length=32,
+        max_new_tokens=3,
+        min_chunk_tokens=1,
+        run_fullkv_parity=True,
+        prompt_serialization="chat",
+    )
+
+    run = payload["runs"][0]
+    assert payload["protocols"]["gsm8k_chunkkv"]["shots"] == 8
+    assert payload["summary"]["fullkv_parity"]["all_passed"] is True
+    assert payload["summary"]["qualification"]["passed"] is True
+    assert run["protocol"] == CHUNKKV_GSM8K_8SHOT_PROTOCOL
+    assert run["prompt_serialization"] == "chat"
+    assert run["config"]["prompt_serialization"] == "chat"
+    assert len(run["raw_prompt_sha256"]) == 64
+    assert len(run["prompt_sha256"]) == 64
+    assert run["raw_prompt_sha256"] != run["prompt_sha256"]
+    assert len(run["input_token_sha256"]) == 64
+    assert run["generated_token_ids"]
+    assert run["judgment"]["judge"] == "gsm8k_final_numeric_exact_match"
+    assert run["judgment"]["normalized_gold"] == "4"
+    assert run["runtime"]["stages"]["generation"]["elapsed_ms"] >= 0.0
+    assert payload["environment"]["seed"] == 42
+    assert payload["experiment_fingerprint"]
+    assert tokenizer.template_calls == 1
+    assert len(tokenizer.tokenizer_calls) == 1
+    assert tokenizer.tokenizer_calls[0][1]["add_special_tokens"] is False
+
+
+def test_hf_grid_all_methods_have_fair_scores_runtime_and_resume(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "records.jsonl"
+    dataset_path.write_text(
+        '{"id":"sample-1","prompt":"ignored","answer":"1"}\n',
+        encoding="utf-8",
+    )
+    model = _model_for_family("qwen2")
+    tokenizer = _TokenFixture()
+    monkeypatch.setattr(
+        hf_runner,
+        "load_hf_model_and_tokenizer",
+        lambda *_args, **_kwargs: HfModelBundle(
+            model=model,
+            tokenizer=tokenizer,
+            device=torch.device("cpu"),
+        ),
+    )
+    spec = hf_runner.DatasetSpec(
+        name="local",
+        source=str(dataset_path),
+        prompt_field="prompt",
+        answer_field="answer",
+        id_field="id",
+    )
+    checkpoint = tmp_path / "checkpoint.json"
+    kwargs = dict(
+        model_names=["tiny/qwen2"],
+        dataset_specs=[spec],
+        budgets=[],
+        budget_ratios=[0.5],
+        thetas=[0.3],
+        recent_windows=[2],
+        alphas=[0.6],
+        methods=[
+            "fullkv",
+            "streamingllm",
+            "h2o",
+            "snapkv",
+            "chunkkv",
+            "tdc_kv",
+        ],
+        max_samples=1,
+        max_new_tokens=2,
+        min_chunk_tokens=1,
+        max_chunk_tokens=4,
+        prefill_block_size=3,
+        checkpoint_path=checkpoint,
+    )
+
+    payload = hf_runner.run_hf_grid(**kwargs)
+    successful = [row for row in payload["runs"] if row["status"] == "ok"]
+
+    assert checkpoint.exists()
+    assert payload["summary"]["qualification"]["passed"] is True
+    assert {row["method"] for row in successful} == {
+        "fullkv",
+        "streamingllm",
+        "h2o",
+        "snapkv",
+        "chunkkv",
+        "tdc_kv",
+    }
+    assert all(row.get("run_key") for row in successful)
+    compressed = [row for row in successful if row["method"] != "fullkv"]
+    assert all(row["config"]["decode_policy"] == "common_streaming" for row in compressed)
+    assert all(row["kept_tokens"] == row["config"]["budget"] for row in compressed)
+    assert all(row["runtime"]["stages"]["policy"]["elapsed_ms"] >= 0 for row in compressed)
+    chunkkv = next(row for row in compressed if row["method"] == "chunkkv")
+    tdc = next(row for row in compressed if row["method"] == "tdc_kv")
+    assert chunkkv["score_source"] == "direct_attention_only"
+    assert tdc["score_source"] == "attention_plus_dependency_routing"
+
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    saved["runs"].append(
+        {
+            "status": "error",
+            "model": "tiny/qwen2",
+            "dataset": "local",
+            "sample_id": "sample-1",
+            "error": "transient",
+        }
+    )
+    checkpoint.write_text(json.dumps(saved), encoding="utf-8")
+
+    resumed = hf_runner.run_hf_grid(**kwargs, resume=True)
+    assert all(row["status"] == "ok" for row in resumed["runs"])
+    assert [row["run_key"] for row in resumed["runs"] if row.get("run_key")] == [
+        row["run_key"] for row in payload["runs"] if row.get("run_key")
+    ]
 
 
 @pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])

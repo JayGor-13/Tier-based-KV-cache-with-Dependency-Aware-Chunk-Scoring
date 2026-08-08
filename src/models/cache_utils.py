@@ -34,6 +34,20 @@ class HfModelBundle:
 
 
 @dataclass
+class PreparedPrompt:
+    """A model-ready prompt shared by FullKV and cache-prefill paths."""
+
+    raw_text: str
+    rendered_text: str
+    serialization: str
+    model_inputs: dict[str, torch.Tensor]
+
+    @property
+    def input_ids(self) -> torch.Tensor:
+        return self.model_inputs["input_ids"]
+
+
+@dataclass
 class HfPrefillRecord:
     """Tensors extracted from one prompt prefill pass."""
 
@@ -57,11 +71,20 @@ class HfPrefillRecord:
 
 
 @dataclass(frozen=True)
+class HfGenerationResult:
+    """Generated FullKV continuation and its exact token IDs."""
+
+    text: str
+    token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class EvictedGenerationResult:
     """Generated text plus bounded-cache diagnostics."""
 
     text: str
     cache_summary: dict[str, int]
+    token_ids: tuple[int, ...]
 
 
 def resolve_device(device: str | torch.device = "auto") -> torch.device:
@@ -164,6 +187,78 @@ def model_device(model: Any) -> torch.device:
         return next(model.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+def prepare_prompt(
+    *,
+    tokenizer: Any,
+    prompt: str,
+    max_length: int | None = None,
+    serialization: str = "auto",
+) -> PreparedPrompt:
+    """Render and tokenize a prompt once for every generation/cache path."""
+    requested = str(serialization).strip().lower()
+    if requested not in {"auto", "raw", "chat"}:
+        raise ValueError("Prompt serialization must be `auto`, `raw`, or `chat`.")
+
+    has_chat_template = bool(getattr(tokenizer, "chat_template", None)) and callable(
+        getattr(tokenizer, "apply_chat_template", None)
+    )
+    resolved = "chat" if requested == "auto" and has_chat_template else requested
+    if resolved == "auto":
+        resolved = "raw"
+    if resolved == "chat" and not has_chat_template:
+        raise ValueError(
+            "Chat prompt serialization was requested, but the tokenizer has no "
+            "chat template. Use `raw` or a tokenizer with `apply_chat_template`."
+        )
+
+    raw_text = str(prompt)
+    if resolved == "chat":
+        rendered_text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": raw_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        add_special_tokens = False
+    else:
+        rendered_text = raw_text
+        add_special_tokens = True
+
+    tokenizer_kwargs: dict[str, Any] = {
+        "return_tensors": "pt",
+        "add_special_tokens": add_special_tokens,
+    }
+    if max_length is not None:
+        tokenizer_kwargs.update({"truncation": True, "max_length": int(max_length)})
+    encoded = tokenizer(rendered_text, **tokenizer_kwargs)
+    model_inputs = {
+        key: value.detach().cpu().clone()
+        for key, value in encoded.items()
+        if isinstance(value, torch.Tensor)
+    }
+    input_ids = model_inputs.get("input_ids")
+    if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError("Prepared prompts require tokenizer input_ids with batch size 1.")
+    if input_ids.shape[1] == 0:
+        raise ValueError("Prompt serialization produced no input tokens.")
+
+    return PreparedPrompt(
+        raw_text=raw_text,
+        rendered_text=str(rendered_text),
+        serialization=resolved,
+        model_inputs=model_inputs,
+    )
+
+
+def _prepared_inputs_on_device(
+    prepared_prompt: PreparedPrompt,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value.to(device)
+        for key, value in prepared_prompt.model_inputs.items()
+    }
 
 
 def build_position_kwargs(
@@ -382,6 +477,7 @@ def run_hf_prefill(
     prefill_block_size: int = 128,
     chunk_constructor: SentenceBoundaryChunkConstructor | None = None,
     offload_to_cpu: bool = True,
+    prepared_prompt: PreparedPrompt | None = None,
 ) -> HfPrefillRecord:
     """Run bounded-attention blockwise prefill and return TDC-KV-ready tensors."""
     if prefill_block_size <= 0:
@@ -390,15 +486,16 @@ def run_hf_prefill(
         raise ValueError("observation_window must be positive.")
 
     device = model_device(model)
-    tokenizer_kwargs: dict[str, Any] = {"return_tensors": "pt"}
-    if max_length is not None:
-        tokenizer_kwargs.update({"truncation": True, "max_length": int(max_length)})
-    encoded = tokenizer(prompt, **tokenizer_kwargs)
-    encoded = {
-        key: value.to(device)
-        for key, value in encoded.items()
-        if isinstance(value, torch.Tensor)
-    }
+    if prepared_prompt is None:
+        prepared_prompt = prepare_prompt(
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_length=max_length,
+            serialization="raw",
+        )
+    elif prepared_prompt.raw_text != str(prompt):
+        raise ValueError("Prepared prompt does not match the supplied raw prompt.")
+    encoded = _prepared_inputs_on_device(prepared_prompt, device)
 
     input_ids = encoded["input_ids"]
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -549,7 +646,7 @@ def run_hf_prefill(
 
     return HfPrefillRecord(
         sample_id=sample_id,
-        prompt=prompt,
+        prompt=prepared_prompt.rendered_text,
         input_ids=input_ids_cpu,
         chunks=chunks,
         chunk_map=chunk_map,
@@ -571,21 +668,25 @@ def generate_text(
     prompt: str,
     max_new_tokens: int,
     max_length: int | None = None,
-) -> str:
+    return_details: bool = False,
+    prepared_prompt: PreparedPrompt | None = None,
+) -> str | HfGenerationResult:
     """Generate a deterministic continuation from the base HF model."""
     if max_new_tokens <= 0:
-        return ""
+        empty = HfGenerationResult(text="", token_ids=())
+        return empty if return_details else empty.text
 
     device = model_device(model)
-    tokenizer_kwargs: dict[str, Any] = {"return_tensors": "pt"}
-    if max_length is not None:
-        tokenizer_kwargs.update({"truncation": True, "max_length": int(max_length)})
-    encoded = tokenizer(prompt, **tokenizer_kwargs)
-    encoded = {
-        key: value.to(device)
-        for key, value in encoded.items()
-        if isinstance(value, torch.Tensor)
-    }
+    if prepared_prompt is None:
+        prepared_prompt = prepare_prompt(
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_length=max_length,
+            serialization="raw",
+        )
+    elif prepared_prompt.raw_text != str(prompt):
+        raise ValueError("Prepared prompt does not match the supplied raw prompt.")
+    encoded = _prepared_inputs_on_device(prepared_prompt, device)
 
     with torch.no_grad():
         generated = model.generate(
@@ -597,7 +698,12 @@ def generate_text(
 
     prompt_len = int(encoded["input_ids"].shape[1])
     continuation = generated[0, prompt_len:]
-    return tokenizer.decode(continuation, skip_special_tokens=True).strip()
+    token_ids = tuple(int(token_id) for token_id in continuation.detach().cpu().tolist())
+    result = HfGenerationResult(
+        text=tokenizer.decode(continuation, skip_special_tokens=True).strip(),
+        token_ids=token_ids,
+    )
+    return result if return_details else result.text
 
 
 @contextmanager
@@ -659,7 +765,7 @@ def generate_text_with_evicted_cache(
 ) -> str | EvictedGenerationResult:
     """Generate text dynamically using an already evicted KV cache."""
     if max_new_tokens <= 0:
-        empty_result = EvictedGenerationResult(text="", cache_summary={})
+        empty_result = EvictedGenerationResult(text="", cache_summary={}, token_ids=())
         return empty_result if return_details else empty_result.text
 
     device = model_device(model)
@@ -760,13 +866,18 @@ def generate_text_with_evicted_cache(
         text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
         cache_summary = cache_manager.summary() if cache_manager is not None else {}
         cache_summary["generated_tokens"] = len(generated_tokens)
-        result = EvictedGenerationResult(text=text, cache_summary=cache_summary)
+        result = EvictedGenerationResult(
+            text=text,
+            cache_summary=cache_summary,
+            token_ids=tuple(int(token_id) for token_id in generated_tokens),
+        )
         return result if return_details else result.text
 
 
 __all__ = [
     "HfModelBundle",
     "HfPrefillRecord",
+    "HfGenerationResult",
     "EvictedGenerationResult",
     "build_position_kwargs",
     "extended_rotary_position_capacity",

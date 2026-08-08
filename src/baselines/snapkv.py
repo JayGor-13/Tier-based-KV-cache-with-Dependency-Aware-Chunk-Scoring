@@ -69,6 +69,7 @@ def evict_snapkv(
     recent_window: int = 64,
     sink_tokens: int = 0,
     kernel_size: int = 5,
+    token_scores: torch.Tensor | None = None,
 ) -> EvictionResult:
     """Evict using SnapKV baseline policy.
 
@@ -87,8 +88,12 @@ def evict_snapkv(
             keep_mask=keep_all, k_cache=k_cache, v_cache=v_cache, budget=budget
         )
 
-    scores = snapkv_token_scores(
-        attention_obs, window_size=recent_window, kernel_size=kernel_size
+    scores = (
+        snapkv_token_scores(
+            attention_obs, window_size=recent_window, kernel_size=kernel_size
+        )
+        if token_scores is None
+        else token_scores.to(dtype=torch.float32)
     ).to(device=k_cache.device)
     if scores.numel() != t:
         raise ValueError(
