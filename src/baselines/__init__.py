@@ -3,6 +3,8 @@
 from .chunkkv import chunkkv_chunk_keep_indices, evict_chunkkv
 from .h2o import evict_h2o, h2o_token_scores
 from .snapkv import evict_snapkv, snapkv_token_scores
+from .streamingllm import evict_streamingllm
+from .random import evict_random
 
 __all__ = [
     "chunkkv_chunk_keep_indices",
@@ -11,4 +13,6 @@ __all__ = [
     "evict_snapkv",
     "h2o_token_scores",
     "snapkv_token_scores",
+    "evict_streamingllm",
+    "evict_random",
 ]

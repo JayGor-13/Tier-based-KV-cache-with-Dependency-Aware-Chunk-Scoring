@@ -82,13 +82,15 @@ def main() -> None:
                 }
             )
 
-    ablation_rows.sort(key=lambda x: x["summary"]["avg_compression_ratio"], reverse=True)
     payload = {
         "config": {
             "trace_path": args.trace_path,
             "budget": args.budget,
             "theta_grid": theta_grid,
             "recent_window_grid": recent_window_grid,
+            "allow_level2_fallback": True,
+            "min_budget_utilization": 0.99,
+            "max_budget_shortfall_tokens": 1,
         },
         "ablations": ablation_rows,
     }
@@ -98,10 +100,9 @@ def main() -> None:
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Wrote ablation results to {output_path}")
     if ablation_rows:
-        best = ablation_rows[0]
         print(
-            "Best config by avg_compression_ratio: "
-            f"theta={best['theta']}, recent_window={best['recent_window']}"
+            "Trace ablations report cache behavior only. Select the best "
+            "configuration from live task-quality metrics."
         )
 
 

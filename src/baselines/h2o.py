@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from src.baselines._utils import build_result_from_keep_mask, forced_keep_mask, topk_from_candidates
+from src.baselines._utils import (
+    build_result_from_keep_mask,
+    forced_keep_mask,
+    topk_from_candidates,
+    trim_keep_mask_to_budget,
+)
 from src.core.evictor import EvictionResult
 
 
@@ -44,6 +49,7 @@ def evict_h2o(
     recent_window: int = 16,
     sink_tokens: int = 1,
     heavy_hitter_ratio: float = 1.0,
+    token_scores: torch.Tensor | None = None,
 ) -> EvictionResult:
     """Evict using H2O-style policy.
 
@@ -63,7 +69,11 @@ def evict_h2o(
             keep_mask=keep_all, k_cache=k_cache, v_cache=v_cache, budget=budget
         )
 
-    scores = h2o_token_scores(attention_obs).to(device=k_cache.device)
+    scores = (
+        h2o_token_scores(attention_obs)
+        if token_scores is None
+        else token_scores.to(dtype=torch.float32)
+    ).to(device=k_cache.device)
     if scores.numel() != t:
         raise ValueError(
             f"attention_obs token axis ({scores.numel()}) does not match cache length ({t})."
@@ -79,6 +89,7 @@ def evict_h2o(
     forced_count = int(keep_mask.sum().item())
     remaining_capacity = max(min(budget, t) - forced_count, 0)
     if remaining_capacity <= 0:
+        keep_mask = trim_keep_mask_to_budget(keep_mask, scores, budget)
         return build_result_from_keep_mask(
             keep_mask=keep_mask, k_cache=k_cache, v_cache=v_cache, budget=budget
         )
@@ -97,12 +108,7 @@ def evict_h2o(
         filler_idx = topk_from_candidates(scores, filler_candidates, fill_capacity)
         keep_mask[filler_idx] = True
 
-    if int(keep_mask.sum().item()) > budget:
-        keep_idx = torch.nonzero(keep_mask, as_tuple=False).flatten()
-        keep_scores = scores[keep_idx]
-        drop_n = int(keep_mask.sum().item()) - budget
-        to_drop_local = torch.topk(keep_scores, k=drop_n, largest=False).indices
-        keep_mask[keep_idx[to_drop_local]] = False
+    keep_mask = trim_keep_mask_to_budget(keep_mask, scores, budget)
 
     return build_result_from_keep_mask(
         keep_mask=keep_mask, k_cache=k_cache, v_cache=v_cache, budget=budget

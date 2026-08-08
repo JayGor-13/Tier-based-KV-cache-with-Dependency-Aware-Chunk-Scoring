@@ -10,10 +10,15 @@ from typing import Any, Sequence
 
 import torch
 
-from benchmarks.eval_metrics import CacheMetrics, compute_cache_metrics
+from benchmarks.eval_metrics import (
+    CacheMetrics,
+    compute_cache_metrics,
+    validate_budget_contract,
+)
 from src.baselines.chunkkv import evict_chunkkv
 from src.baselines.h2o import evict_h2o
 from src.baselines.snapkv import evict_snapkv
+from src.baselines.streamingllm import evict_streamingllm
 from src.core.evictor import EvictionResult, evict_kv_cache
 from src.core.masker import assign_protection_tiers, infer_sequence_length
 
@@ -25,6 +30,7 @@ class TraceSample:
     chunk_scores: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
+    dependency_scores: torch.Tensor | None = None
     budget: int | None = None
     attention_obs: torch.Tensor | None = None
     gold: str | None = None
@@ -86,6 +92,18 @@ def parse_trace_record(record: dict[str, Any], *, sample_index: int = 0) -> Trac
     if chunk_scores.numel() != len(chunks):
         raise ValueError("`chunk_scores` length must match number of chunks.")
 
+    dependency_scores = None
+    if "dependency_scores" in record:
+        dependency_scores = _to_tensor(
+            record["dependency_scores"], dtype=torch.float32
+        )
+        if dependency_scores.ndim != 1:
+            raise ValueError("`dependency_scores` must be 1D.")
+        if dependency_scores.numel() != len(chunks):
+            raise ValueError(
+                "`dependency_scores` length must match number of chunks."
+            )
+
     if "k_cache" in record:
         k_cache = _to_tensor(record["k_cache"], dtype=torch.float32)
     else:
@@ -119,6 +137,7 @@ def parse_trace_record(record: dict[str, Any], *, sample_index: int = 0) -> Trac
         sample_id=str(record.get("id", f"sample_{sample_index}")),
         chunks=chunks,
         chunk_scores=chunk_scores,
+        dependency_scores=dependency_scores,
         k_cache=k_cache,
         v_cache=v_cache,
         budget=record.get("budget"),
@@ -173,6 +192,9 @@ def run_tdc_policy(
     budget: int,
     theta: float = 0.3,
     recent_window: int = 16,
+    allow_level2_fallback: bool = True,
+    min_budget_utilization: float = 0.99,
+    max_budget_shortfall_tokens: int = 1,
 ) -> tuple[EvictionResult, torch.Tensor, CacheMetrics]:
     tiers = assign_protection_tiers(
         chunk_scores=sample.chunk_scores,
@@ -180,6 +202,7 @@ def run_tdc_policy(
         theta=theta,
         recent_window=recent_window,
         sequence_length=sample.sequence_length,
+        protection_scores=sample.dependency_scores,
     )
     t0 = time.perf_counter()
     result = evict_kv_cache(
@@ -189,6 +212,7 @@ def run_tdc_policy(
         k_cache=sample.k_cache,
         v_cache=sample.v_cache,
         budget=budget,
+        allow_level2_fallback=allow_level2_fallback,
     )
     latency_ms = (time.perf_counter() - t0) * 1000.0
     metrics = compute_cache_metrics(
@@ -197,6 +221,11 @@ def run_tdc_policy(
         budget=budget,
         kept_length=int(result.kept_indices.numel()),
         latency_ms=latency_ms,
+    )
+    validate_budget_contract(
+        metrics,
+        min_utilization=min_budget_utilization,
+        max_shortfall_tokens=max_budget_shortfall_tokens,
     )
     return result, tiers, metrics
 
@@ -211,7 +240,14 @@ def run_baseline_policy(
     heavy_hitter_ratio: float = 0.7,
 ) -> tuple[EvictionResult, CacheMetrics]:
     method = method.lower()
-    if method == "chunkkv":
+    if method == "streamingllm":
+        result = evict_streamingllm(
+            k_cache=sample.k_cache,
+            v_cache=sample.v_cache,
+            budget=budget,
+            num_sink_tokens=1,
+        )
+    elif method == "chunkkv":
         result = evict_chunkkv(
             chunk_scores=sample.chunk_scores,
             chunks=sample.chunks,
@@ -257,6 +293,7 @@ def run_baseline_policy(
         kept_length=int(result.kept_indices.numel()),
         latency_ms=0.0,
     )
+    validate_budget_contract(metrics)
     return result, metrics
 
 

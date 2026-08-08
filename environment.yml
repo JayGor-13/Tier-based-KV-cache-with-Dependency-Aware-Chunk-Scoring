@@ -1,10 +1,8 @@
-﻿name: tdc-kv
+name: tdc-kv
 channels:
   - defaults
 dependencies:
-  - python=3.11
+  - python=3.12
   - pip
-  - pytest
   - pip:
-      - torch
-      - numpy
+      - -r requirements.txt

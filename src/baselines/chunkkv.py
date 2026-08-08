@@ -6,7 +6,10 @@ from typing import Sequence
 
 import torch
 
-from src.baselines._utils import build_result_from_keep_mask
+from src.baselines._utils import (
+    build_result_from_keep_mask,
+    resize_keep_mask_to_budget,
+)
 from src.core.evictor import EvictionResult
 
 Chunk = Sequence[int] | torch.Tensor
@@ -90,14 +93,41 @@ def evict_chunkkv(
     )
 
     keep_mask = torch.zeros(t, dtype=torch.bool, device=k_cache.device)
+    token_scores = torch.full(
+        (t,),
+        torch.finfo(torch.float32).min,
+        dtype=torch.float32,
+        device=k_cache.device,
+    )
     for chunk_id in kept_chunk_ids.tolist():
         idx = torch.as_tensor(chunks[chunk_id], dtype=torch.long, device=k_cache.device)
         if idx.numel() == 0:
             continue
         keep_mask[idx] = True
+    for chunk_id, chunk in enumerate(chunks):
+        idx = torch.as_tensor(chunk, dtype=torch.long, device=k_cache.device)
+        if idx.numel() > 0:
+            token_scores[idx] = chunk_scores[chunk_id].to(
+                device=k_cache.device,
+                dtype=torch.float32,
+            )
+
+    keep_mask = resize_keep_mask_to_budget(keep_mask, token_scores, budget)
+    partially_evicted_chunks = 0
+    for chunk in chunks:
+        idx = torch.as_tensor(chunk, dtype=torch.long, device=k_cache.device)
+        if idx.numel() == 0:
+            continue
+        kept_in_chunk = int(keep_mask[idx].sum().item())
+        if 0 < kept_in_chunk < int(idx.numel()):
+            partially_evicted_chunks += 1
 
     return build_result_from_keep_mask(
-        keep_mask=keep_mask, k_cache=k_cache, v_cache=v_cache, budget=budget
+        keep_mask=keep_mask,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        budget=budget,
+        partially_evicted_chunks=partially_evicted_chunks,
     )
 
 

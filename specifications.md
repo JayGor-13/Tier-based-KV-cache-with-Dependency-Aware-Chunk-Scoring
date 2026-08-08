@@ -19,12 +19,14 @@ The pipeline *only* triggers when a new token causes **$t > B$**.
 
 **Parameters:**
 *   **$P_{vocab}$:** A constant `set` of integers. These are the token IDs for `{ . , ? , ! , ; , : }` loaded directly from the model's Tokenizer.
+*   **$C_{max}=64$:** Maximum tokens per chunk. Longer punctuation-free spans are split into contiguous bounded subchunks.
 
 **Mathematical Transformation:**
 1.  Boolean masking: Create $B \in \{0, 1\}^{t}$ where $B[i] = 1$ if $X[i] \in P_{vocab}$, else $0$.
 2.  Find indices where $B=1$. Let this be vector $\mathbf{p} = [p_1, p_2, \dots, p_m]$.
 3.  Define bounds: $p_0 = 0$, $p_{m+1} = t$.
 4.  Construct list of index arrays: $C_k = [p_{k-1}+1 \dots p_k]$ for $k=1 \dots m+1$.
+5.  Split every $C_k$ longer than $C_{max}$ into ordered contiguous subchunks, preserving complete token coverage and enforcing $|C_k| \le C_{max}$.
 
 **Outputs (Data leaving Mod 1):**
 *   **$\mathbf{C}$**: A `list of 1D tensors/arrays` representing the token indices belonging to each chunk. (Total $M$ chunks).
@@ -42,6 +44,7 @@ $\mathbf{C}$ and $\mathbf{Map}$ are passed immediately to **Module 2** to tell i
 **Inputs:**
 *   **$A_{obs}$**: `float16/bfloat16 tensor` of shape `[H, w, t]` (Attention map of observation window).
 *   **$\mathbf{C}$**: List of length $M$ from Module 1.
+*   **$G$**: Sparse chunk-dependency graph with at most $k$ outgoing edges per chunk.
 
 **Parameters:**
 *   **$\alpha = 0.6$**, **$\beta = 0.4$** (Mixing coefficients).
@@ -52,17 +55,21 @@ $\mathbf{C}$ and $\mathbf{Map}$ are passed immediately to **Module 2** to tell i
 *   **Signal 1 (Attention Mass):** How much do the $w$ recent queries look at historical token $j$? 
     $$M \in \mathbb{R}^{t} \quad \text{where} \quad M[j] = \sum_{h=1}^H \sum_{q=t-w+1}^{t} A_{obs}[h, q, j]$$
     *   *Operation:* Sum $A_{obs}$ over the $w$ and $H$ dimensions. Output shape `[t]`.
-*   **Signal 2 (Forward Routing):** Does token $j$ (in the observation window) attend strongly to high $M$ tokens?
-    $$R \in \mathbb{R}^{t}$$
-    $$R[j] = \sum_{h=1}^H \sum_{i=1}^{t} (A_{obs}[h, j_{local}, i] \times M[i])$$ 
-    *(Note: We only calculate $R[j]$ for tokens inside $w$ to save compute, defaulting others to a moving average, saving massive GPU cycles).*
-*   **Chunk Aggregation:** Average token scores into their specific blocks:
-    $$S_1[k] = \text{mean}(M[C_k]), \quad S_2[k] = \text{mean}(R[C_k])$$
+*   **Sparse Dependency Collection:** During prefill, aggregate each query chunk's attention into key-chunk mass. Remove the self-edge, retain the strongest $k$ edges, and normalize each sparse row:
+    $$G[q,r] = \operatorname{mean}_{j \in C_q, h}\sum_{i \in C_r} A[h,j,i]$$
+    $$\sum_{r \in N(q)} G[q,r] = 1, \quad |N(q)| \le k$$
+*   **Signal 2 (Historical Dependency Routing):** First aggregate direct attention mass into chunks, then route current relevance through historical dependencies:
+    $$S_1[q] = \text{mean}(M[C_q])$$
+    $$S_2[q] = \sum_{r \in N(q)} G[q,r] \times \hat{S}_1[r]$$
+    Chunks without historical edges fall back to their direct relevance $\hat{S}_1[q]$.
 *   **Fusion:** Min-max normalize both to $[0,1]$, resulting in $\hat{S}_1$ and $\hat{S}_2$.
     $$\mathbf{Score_{chunk}}[k] = (\alpha \times \hat{S}_1[k]) + (\beta \times \hat{S}_2[k])$$
 
 **Outputs (Data leaving Mod 2):**
 *   **$\mathbf{Score_{chunk}}$:** `float tensor` of shape `[M]` representing mathematical importance per chunk.
+*   **Graph storage:** $O(Mk)$ rather than a persistent dense $O(M^2)$ chunk graph.
+
+**Current implementation note:** HuggingFace prefill is causal and blockwise. For each query block, selected attention layers are aggregated and immediately streamed into the sparse graph builder; only rows overlapping the final observation window are retained. Dense attention memory is therefore bounded by $O(LHBt)$ for block size $B$, rather than retaining the full $O(LHt^2)$ attention tensor. The cumulative full prompt KV cache remains resident until eviction.
 
 **Data Transition ➡️:**
 The continuous values of $\mathbf{Score_{chunk}}$ are passed to **Module 3** to be quantized into 3 physical safety buckets.
@@ -74,7 +81,8 @@ The continuous values of $\mathbf{Score_{chunk}}$ are passed to **Module 3** to 
 *   **Goal:** Convert continuous decimals ($0.423, 0.991, 0.121$) into discrete logical Tiers $(0, 1, 2)$.
 
 **Inputs:**
-*   **$\mathbf{Score_{chunk}}$**: Shape `[M]`.
+*   **$\mathbf{Score_{chunk}}$**: Fused score of shape `[M]`, used for within-tier eviction ordering.
+*   **$\hat{S}_2$**: Dependency-routing score of shape `[M]`, used to assign Tier 1.
 *   **$\mathbf{C}$**: Structure from Mod 1 identifying token positions per chunk.
 
 **Parameters:**
@@ -83,8 +91,9 @@ The continuous values of $\mathbf{Score_{chunk}}$ are passed to **Module 3** to 
 
 **Mathematical Transformation:**
 1.  Initialize **$\mathbf{\Pi}$**: An integer tensor of shape `[M]` initialized entirely to $0$.
-2.  **Level 1 Masking:** Calculate a dynamic boundary cutoff value $V = \text{Percentile}(\mathbf{Score_{chunk}}, 1-\theta)$.
-    $$ \mathbf{\Pi}[ \mathbf{Score_{chunk}} \ge V ] = 1 $$
+2.  **Level 1 Masking:** Exclude Tier-2 sink/recent chunks, then select exactly $\lceil\theta M_{eligible}\rceil$ eligible chunks with the highest dependency-routing scores.
+    $$ \mathbf{\Pi}[\operatorname{TopK}(\hat{S}_2, \lceil\theta M_{eligible}\rceil)] = 1 $$
+    Tier 1 is therefore independent of fused-score ordering: a bridge chunk with modest direct attention can be soft-protected because of its historical dependency route.
 3.  **Level 2 Masking:** Override based on static positions. Let chunk 0 containing token $0$ (the attention sink) be $C_{sink}$ and the chunk containing the start of the observation window ($t-w$) be $C_{recent}$.
     $$\mathbf{\Pi}[C_{sink}] = 2, \quad \mathbf{\Pi}[C_{recent} \dots M] = 2$$
 
@@ -114,15 +123,67 @@ Everything is now shipped to the Executor (**Module 4**), containing the final v
 2.  Identify **Target 0 chunks**: $Q_0 = \{ k \mid \mathbf{\Pi}[k] == 0 \}$. Sort $Q_0$ in *ascending* order based on $\mathbf{Score_{chunk}}[k]$.
 3.  Loop through sorted $Q_0$:
     *   Let $idx$ = token indices for chunk $C_{curr}$.
-    *   Set `KeepMask`$[idx]$ = `False`.
-    *   TokensRemoved += $|C_{curr}|$
-    *   If TokensRemoved $\ge$ Deficit: `BREAK loop`
-4.  *Safety Net:* If TokensRemoved < Deficit (we ran out of Level 0s), repeat Steps 2 & 3 but targeting Level 1 chunks ($Q_1$). *(Level 2s are literally skipped, loop impossible here).*
-5.  Get non-deleted integer indices: `idx_retained = torch.nonzero(KeepMask)`. This creates a flattened index of shape `[Final_Count]` where $Final\_Count \approx B$.
+    *   If $|C_{curr}|$ does not exceed the remaining deficit, remove the complete chunk.
+    *   Otherwise, remove exactly the remaining number of oldest positions from $C_{curr}$ and retain its later positions.
+    *   Stop when TokensRemoved equals Deficit. Thus at most one boundary chunk is partially evicted.
+4.  *Safety Net:* If TokensRemoved < Deficit, repeat Steps 2 and 3 for Level 1, then Level 2 only when matched-budget fallback is enabled.
+5.  Get non-deleted integer indices: `idx_retained = torch.nonzero(KeepMask)`. For matched-budget runs, `Final_Count = min(B,t)`.
 
 **Outputs (Returning to the base LLM Model):**
 *   **$K_{cache}^{new} = K_{cache}[\text{:} \:, idx\_retained, \text{: }]$** (New Shape: `[H, Final_Count, d]`).
 *   **$V_{cache}^{new} = V_{cache}[\text{:} \:, idx\_retained, \text{: }]$**
+
+### Decode-Time Budget Enforcement
+
+After prefill eviction, the decoding cache manager stores one metadata entry per physical KV position: original logical position, chunk/group id, fused score, and persistent Tier-1 status. Sink and recent Tier-2 status are recomputed from logical positions after every generated token.
+
+For each decode step:
+
+1. Process one generated token, temporarily growing the cache by one position.
+2. Append matching metadata for that position.
+3. If the cache exceeds $B$, remove complete Tier-0 groups by ascending fused score, then Tier-1 groups.
+4. When the final selected group is larger than the remaining deficit, trim only its oldest required positions. At most one group is partially trimmed per enforcement pass.
+5. If Tier-2 tokens alone exceed $B$, apply the same oldest-position boundary refinement and record a fallback event.
+5. Apply the retained physical indices to every key/value layer and rebuild the model cache.
+
+The enforced invariant is:
+
+$$|K_{cache}^{post-step}| = |V_{cache}^{post-step}| = \min(B,t)$$
+
+Generated tokens use individual groups in the current implementation. They remain Tier 2 while inside the recent window and become low-priority eviction candidates after aging out.
+
+Offline integration tests exercise this invariant with tiny GPT-2, Llama, and
+Qwen2 causal language models. They compare compressed-cache logits against an
+independent forward pass, verify global `position_ids` and version-dependent
+`cache_position` values for RoPE
+families, and require exact budget occupancy after repeated token-granular
+decode eviction. Prefill and decode use the same final-group boundary
+refinement, and matched-budget experiments require utilization of at least
+`0.99`, shortfall of at most one token, and zero overflow.
+
+All cache tensor access passes through a shared HuggingFace compatibility
+adapter. It supports legacy tuple caches, v4 cache lists, and v5
+`DynamicCache.layers` while exposing the same ordered key/value layer contract
+to prefill extraction and decode-time compaction.
+
+### Dataset Evaluation Contract
+
+Every QA summary retains generic full-generation EM/F1 for debugging and also
+publishes `primary_metric` and `primary_score` for result tables:
+
+* GSM8K uses accuracy of the extracted final numeric answer. The reference is
+  read after `####`; generated text uses its `####` suffix, boxed answer, or
+  final numeric value in that order.
+* NIAH uses exact retrieval accuracy. A response is correct only when the full
+  normalized needle appears as a contiguous token sequence, so verbose answers
+  are accepted but partial-key collisions are rejected.
+* HotpotQA uses the official normalized answer F1 as primary and official answer
+  EM as secondary, including the special handling for `yes`, `no`, and
+  `noanswer`.
+
+Empty generations remain in the denominator as incorrect predictions. A
+multi-dataset aggregate reports an unweighted `macro_task_score`; paper tables
+must use the per-dataset grouped results rather than generic output F1.
 
 ### Final Check
 

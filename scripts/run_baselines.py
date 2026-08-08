@@ -22,7 +22,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--methods",
         type=str,
-        default="chunkkv,snapkv,h2o",
+        default="streamingllm,chunkkv,snapkv,h2o",
         help="Comma-separated baseline methods.",
     )
     parser.add_argument(
@@ -89,6 +89,10 @@ def main() -> None:
                     "budget": budget,
                     "kept_tokens": int(result.kept_indices.numel()),
                     "removed_tokens": int(result.removed_indices.numel()),
+                    "partially_evicted_chunks": result.partially_evicted_chunks,
+                    "budget_utilization": result.budget_utilization,
+                    "budget_shortfall": result.budget_shortfall,
+                    "budget_overflow": result.budget_overflow,
                     "metrics": metrics.to_dict(),
                 }
             )
@@ -106,6 +110,8 @@ def main() -> None:
             "theta": args.theta,
             "recent_window": args.recent_window,
             "heavy_hitter_ratio": args.heavy_hitter_ratio,
+            "min_budget_utilization": 0.99,
+            "max_budget_shortfall_tokens": 1,
         },
         "results": all_results,
     }
