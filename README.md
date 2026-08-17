@@ -24,24 +24,14 @@ runners under `scripts/`.
 ## Setup
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e ".[dev]"
+pip install -r requirements.txt -c constraints-paper.txt
+pip install -e .
 ```
 
 On Colab, keep the runtime-provided PyTorch build. The text-only pipeline does
 not require `torchvision` or `torchaudio`; remove those optional wheels if their
 CUDA build differs from PyTorch. The bundled quickstart performs this cleanup
 before importing Transformers.
-
-With conda:
-
-```bash
-conda env create -f environment.yml
-conda activate tdc-kv
-pip install -e ".[dev]"
-```
 
 ## Verify
 
@@ -95,22 +85,31 @@ progress by default. Pass `--no-progress` only when quiet output is required.
 
 ## Paper Qualification Workflow
 
-Phase 1 adds a strict experiment path on top of the exploratory runner:
+The paper path now enforces the following contracts:
 
 - prompts are serialized exactly once (`raw`, `chat`, or `auto`) and their raw,
   serialized, and token-id SHA-256 hashes are stored;
 - the optional FullKV parity check compares HuggingFace generation with the
   unpruned custom-cache path on the exact same input token ids;
-- FullKV generation, prefill, scoring, policy selection, and decode are timed
-  separately with CUDA synchronization and peak allocated/reserved VRAM;
+- the controlled FullKV and compressed methods share the same measured prefill;
+  method-specific scoring, policy, and decode time are reported separately with
+  CUDA synchronization, per-token decode throughput, peak VRAM, and physical KV
+  tensor bytes before/after eviction;
 - H2O and SnapKV scores are computed once and passed into eviction, while
   ChunkKV uses direct attention scores independently of TDC-KV dependency
   routing;
 - `common_streaming` applies one decode-cache policy to all compressed methods;
 - every successful row has a deterministic run key, and an atomic checkpoint is
   updated after every completed row;
-- the qualification gate rejects failed rows, parity failures, empty
-  generations, missing measurements, and matched-budget violations.
+- frozen record-level dataset manifests keep qualification, tuning, and final
+  partitions disjoint and hash-verified;
+- tokenizer-exact NIAH construction records actual context length/depth, while
+  the qualification gate rejects prompt truncation;
+- model access, immutable Hugging Face revisions, full-context support, eager
+  attention compatibility, CUDA, and estimated VRAM fit are preflighted;
+- the qualification gate also rejects failed rows, parity failures, empty
+  generations, missing measurements, incomplete method/budget coverage, dirty
+  Git state, and matched-budget violations.
 
 Use the local RTX 4050 (6 GB) for tests and a small-model qualification run:
 
@@ -128,7 +127,6 @@ python scripts/run_hf_grid.py \
   --decode-policy common_streaming \
   --prompt-serialization chat \
   --checkpoint outputs/phase1_local.checkpoint.json \
-  --require-qualified --require-cuda \
   --output outputs/phase1_local.json
 ```
 
@@ -146,6 +144,74 @@ first 7B/8B smoke and increase it only after inspecting recorded peak VRAM.
 The local StreamingLLM, H2O, SnapKV, and ChunkKV implementations are explicitly
 tagged as `approximation` in `grid.method_metadata`. Do not describe them as
 bit-for-bit official reference implementations in the paper.
+
+## Complete Paper Experiment Pipeline
+
+First authenticate with a Hugging Face read token. Meta Llama also requires the
+account to have accepted the model license. In PowerShell:
+
+```powershell
+$env:HF_TOKEN="hf_your_read_token"
+```
+
+Resolve and save immutable commits before downloading model weights:
+
+```bash
+python scripts/preflight_hf_models.py --models "Qwen/Qwen2.5-0.5B-Instruct,meta-llama/Meta-Llama-3-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,Qwen/Qwen2.5-7B-Instruct" --output protocol/model_revisions.json
+```
+
+Freeze the dataset protocol once. This command only writes the manifest and
+then stops:
+
+```bash
+python scripts/run_paper_suite.py --profile qualification --freeze-manifest
+```
+
+Review and commit `protocol/model_revisions.json` and
+`protocol/paper_dataset_manifest.json`; final jobs require a clean worktree. Then
+run a one-sample, all-method laptop qualification on the RTX 4050:
+
+```bash
+python scripts/run_paper_suite.py --profile qualification --max-samples 1 --model-revisions-file protocol/model_revisions.json
+```
+
+The 7B/8B eager-FP16 correctness path does not fit a 6 GB RTX 4050. Use an
+A100-class Colab Pro runtime for tuning/final experiments, verify the GPU shown
+by `nvidia-smi`, and run the resumable sharded suite:
+
+```bash
+python scripts/run_paper_suite.py --profile all --model-revisions-file protocol/model_revisions.json --sample-shards 10 --resume
+```
+
+The `all` profile runs qualification, tuning, one deterministic final quality
+pass, three independent timing repetitions, and ablations. Tuning writes
+`selected_config.json` and applies it to all subsequent jobs. Expensive jobs are
+split by model, dataset, and sample shard, with isolated atomic checkpoints.
+Use `--dry-run` to inspect generated commands and `--resume` after interruption.
+
+Once the result jobs finish, produce all CSV/Markdown tables, significance
+tests, and figures with:
+
+```bash
+python scripts/generate_paper_artifacts.py \
+  --inputs "outputs/paper/main_*.json" "outputs/paper/timing_*.json" "outputs/paper/ablation_*.json" \
+  --output-dir outputs/paper/artifacts
+```
+
+The artifact builder refuses unqualified result files and records input hashes.
+Outputs include main results, quality curves, efficiency tables, paired
+Wilcoxon/t-tests with Holm correction, sample-level bootstrap confidence
+intervals, quality/compression curves, NIAH heatmaps, evidence-token eviction
+curves, tier distributions, VRAM/throughput plots, and ablation charts.
+
+Per-run structural logging now includes answer-critical token localization,
+evidence-token retention, evidence-chunk survival, an explicitly labeled global
+shared-mask evidence-token eviction proxy, observed evidence depth, and head
+consensus/diversity. The current implementation does not claim a true
+head/layer reachability GER or per-layer budget allocation. Ablation controls
+expose semantic/fixed/token chunks, Tier-1 removal,
+sink/recent protection removal, and uniform versus linearly weighted all-layer
+attention.
 
 For staged Colab execution, use `notebooks/tdc_kv_actual_testing.ipynb`. It
 verifies `branch-h`, CUDA, focused end-to-end tests, and one-sample smoke runs

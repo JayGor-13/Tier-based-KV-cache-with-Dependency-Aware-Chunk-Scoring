@@ -68,6 +68,8 @@ def assign_protection_tiers(
     recent_window: int = 16,
     sequence_length: int | None = None,
     sink_token_index: int = 0,
+    protect_sink: bool = True,
+    protect_recent: bool = True,
     protection_scores: torch.Tensor | None = None,
     return_details: bool = False,
 ) -> torch.Tensor | MaskerResult:
@@ -114,12 +116,14 @@ def assign_protection_tiers(
 
     tiers = torch.zeros_like(chunk_scores, dtype=torch.int8)
 
-    sink_chunk_index = find_chunk_index(chunks, sink_token_index)
+    sink_chunk_index = (
+        find_chunk_index(chunks, sink_token_index) if protect_sink else -1
+    )
     if sink_chunk_index >= 0:
         tiers[sink_chunk_index] = 2
 
     recent_start_chunk_index = -1
-    if sequence_length > 0:
+    if protect_recent and sequence_length > 0 and recent_window > 0:
         recent_start_token = max(sequence_length - recent_window, 0)
         recent_start_chunk_index = find_chunk_index(chunks, recent_start_token)
         if recent_start_chunk_index >= 0:

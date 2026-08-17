@@ -248,7 +248,9 @@ def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypat
     assert run["generated_token_ids"]
     assert run["judgment"]["judge"] == "gsm8k_final_numeric_exact_match"
     assert run["judgment"]["normalized_gold"] == "4"
-    assert run["runtime"]["stages"]["generation"]["elapsed_ms"] >= 0.0
+    assert run["runtime"]["stages"]["prefill"]["elapsed_ms"] >= 0.0
+    assert run["runtime"]["stages"]["decode"]["elapsed_ms"] >= 0.0
+    assert run["cache_memory"]["kv_bytes_before"] == run["cache_memory"]["kv_bytes_after"]
     assert payload["environment"]["seed"] == 42
     assert payload["experiment_fingerprint"]
     assert tokenizer.template_calls == 1

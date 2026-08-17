@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,11 @@ from benchmarks.qualification import qualification_report
 def parse_args():
     parser = argparse.ArgumentParser(description="Run HF grid search for TDC-KV")
     parser.add_argument("--models", type=str, required=True, help="Comma-separated list of HF model names")
+    parser.add_argument(
+        "--model-revisions",
+        default="",
+        help="Semicolon-separated model=revision pins",
+    )
     parser.add_argument("--datasets", type=str, required=True, help="Comma-separated list of dataset specs (e.g. source=gsm8k,config=main,split=test)")
     parser.add_argument("--budgets", type=str, default="", help="Comma-separated list of absolute budgets")
     parser.add_argument("--budget-ratios", type=str, default="", help="Comma-separated list of budget ratios (0.0 to 1.0)")
@@ -66,6 +72,28 @@ def parse_args():
     parser.add_argument("--layer-index", type=int, default=-1)
     parser.add_argument("--min-chunk-tokens", type=int, default=5)
     parser.add_argument(
+        "--chunking-strategy",
+        choices=("sentence", "fixed", "token"),
+        default="sentence",
+        help="Semantic chunks, fixed-width chunks, or token-level ablation",
+    )
+    parser.add_argument("--fixed-chunk-size", type=int, default=16)
+    parser.add_argument(
+        "--layer-weighting",
+        choices=("linear", "uniform"),
+        default="linear",
+    )
+    parser.add_argument(
+        "--protect-sink",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--protect-recent",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--methods",
         type=str,
         default="tdc_kv",
@@ -84,6 +112,12 @@ def parse_args():
         default="auto",
         help="Model prompt formatting; auto uses a tokenizer chat template when available",
     )
+    parser.add_argument(
+        "--truncation-side",
+        choices=("left", "right"),
+        default="right",
+        help="Side removed only when --max-length is exceeded",
+    )
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
     parser.add_argument("--dtype", type=str, default="auto", help="Torch dtype")
     parser.add_argument("--seed", type=int, default=42)
@@ -92,6 +126,11 @@ def parse_args():
         choices=("common_streaming", "tdc_native"),
         default="common_streaming",
         help="Use a common decode policy for fair comparisons or native TDC metadata",
+    )
+    parser.add_argument(
+        "--experiment-variant",
+        default="default",
+        help="Explicit paper-reporting variant label",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -133,6 +172,12 @@ def parse_args():
         help="Exit nonzero after saving results unless every parity sample matches",
     )
     parser.add_argument(
+        "--parity-max-samples",
+        type=int,
+        default=None,
+        help="Limit parity controls per model/dataset while qualifying the full grid",
+    )
+    parser.add_argument(
         "--require-qualified",
         action="store_true",
         help=(
@@ -145,6 +190,26 @@ def parse_args():
         action="store_true",
         help="Include recorded CUDA availability in the qualification gate",
     )
+    parser.add_argument("--hf-token-env", default="HF_TOKEN")
+    parser.add_argument("--sample-shard-index", type=int, default=0)
+    parser.add_argument("--sample-shard-count", type=int, default=1)
+    parser.add_argument(
+        "--require-model-preflight",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--max-vram-fraction", type=float, default=0.90)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--require-frozen-manifest", action="store_true")
+    parser.add_argument("--require-model-revision", action="store_true")
+    parser.add_argument("--require-driver", action="store_true")
+    parser.add_argument("--require-clean-git", action="store_true")
+    parser.add_argument("--require-exact-niah", action="store_true")
+    parser.add_argument("--require-no-truncation", action="store_true")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -164,6 +229,14 @@ def main():
     args = parse_args()
     
     models = [m.strip() for m in args.models.split(",") if m.strip()]
+    model_revisions = {}
+    for value in args.model_revisions.split(";"):
+        if not value.strip():
+            continue
+        model, separator, revision = value.partition("=")
+        if not separator or not model.strip() or not revision.strip():
+            raise ValueError("Model revision pins must use model=revision entries.")
+        model_revisions[model.strip()] = revision.strip()
     datasets = [parse_dataset_spec(d.strip()) for d in args.datasets.split(";") if d.strip()]
     
     budgets = [int(b.strip()) for b in args.budgets.split(",") if b.strip()]
@@ -187,6 +260,7 @@ def main():
     
     results = run_hf_grid(
         model_names=models,
+        model_revisions=model_revisions,
         dataset_specs=datasets,
         budgets=budgets,
         budget_ratios=budget_ratios,
@@ -199,9 +273,14 @@ def main():
         dependency_top_k=args.dependency_top_k,
         prefill_block_size=args.prefill_block_size,
         tier1_score_mode=args.tier1_score_mode,
+        layer_weighting=args.layer_weighting,
+        protect_sink=args.protect_sink,
+        protect_recent=args.protect_recent,
         attention_mode=args.attention_mode,
         layer_index=args.layer_index,
         min_chunk_tokens=args.min_chunk_tokens,
+        chunking_strategy=args.chunking_strategy,
+        fixed_chunk_size=args.fixed_chunk_size,
         methods=methods,
         max_samples=args.max_samples,
         max_length=args.max_length,
@@ -214,6 +293,7 @@ def main():
             if args.attn_implementation.strip().lower() in {"none", "default"}
             else args.attn_implementation
         ),
+        hf_token=os.getenv(args.hf_token_env) if args.hf_token_env else None,
         allow_level2_fallback=args.allow_level2_fallback,
         continue_on_error=args.continue_on_error,
         progress=args.progress,
@@ -222,19 +302,48 @@ def main():
             or args.require_fullkv_parity
             or args.require_qualified
         ),
+        parity_max_samples=args.parity_max_samples,
         prompt_serialization=args.prompt_serialization,
+        truncation_side=args.truncation_side,
         seed=args.seed,
         decode_policy=args.decode_policy,
+        experiment_variant=args.experiment_variant,
+        sample_shard_index=args.sample_shard_index,
+        sample_shard_count=args.sample_shard_count,
+        require_model_preflight=args.require_model_preflight,
+        preflight_require_cuda=args.require_cuda,
+        max_vram_fraction=args.max_vram_fraction,
+        deterministic=args.deterministic,
         checkpoint_path=checkpoint_path,
         resume=args.resume,
     )
     
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if args.require_qualified or args.require_cuda:
+    strict_qualification_requested = any(
+        (
+            args.require_qualified,
+            args.require_cuda,
+            args.require_frozen_manifest,
+            args.require_model_revision,
+            args.require_driver,
+            args.require_clean_git,
+            args.require_model_preflight,
+            args.require_exact_niah,
+            args.require_no_truncation,
+        )
+    )
+    if strict_qualification_requested:
         results["summary"]["qualification"] = qualification_report(
             results,
             require_parity=args.require_qualified,
             require_cuda=args.require_cuda,
+            require_frozen_manifest=args.require_frozen_manifest,
+            require_model_revision=args.require_model_revision,
+            require_driver=args.require_driver,
+            require_clean_git=args.require_clean_git,
+            require_preflight=args.require_model_preflight,
+            require_exact_niah=args.require_exact_niah,
+            require_no_truncation=args.require_no_truncation,
         )
     output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"Results saved to {output_path}", flush=True)
@@ -248,7 +357,7 @@ def main():
             )
             raise SystemExit(3)
     qualification = results["summary"].get("qualification", {})
-    if (args.require_qualified or args.require_cuda) and not qualification.get(
+    if strict_qualification_requested and not qualification.get(
         "passed", False
     ):
         print("Paper qualification failed:", flush=True)

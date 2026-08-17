@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "python_major_minor": "3.12",
+  "constraints_file": "constraints-paper.txt",
+  "torch_policy": "runtime CUDA build; exact version captured in result metadata",
+  "cuda_required": true,
+  "attention_implementation": "eager",
+  "dtype": "float16",
+  "deterministic_algorithms": true,
+  "max_vram_fraction": 0.9
+}

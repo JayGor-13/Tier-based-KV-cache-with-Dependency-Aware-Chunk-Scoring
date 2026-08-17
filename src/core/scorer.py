@@ -6,8 +6,8 @@ window attention matrix, aggregates them to chunk level, normalizes, and
 fuses into a single Score_chunk vector.
 
 Signal 1 (M): Attention Mass  — how much do recent queries attend TO token j?
-Signal 2 (R): Dependency routing — does a historical chunk depend on chunks
-              that are currently important to recent queries?
+Signal 2 (R): Dependency routing — is a historical chunk a dependency of a
+              chunk that is currently important to recent queries?
 
 When a sparse prefill dependency graph is supplied, routing applies to every
 historical chunk. The observation-window-only calculation remains as a
@@ -56,6 +56,7 @@ class DualSignalScorer:
         beta: float = 0.4,
         window_size: int = 16,
         num_layers: int | None = None,
+        layer_weighting: str = "linear",
         device: str | torch.device = "cpu",
     ) -> None:
         """
@@ -64,7 +65,7 @@ class DualSignalScorer:
         alpha : float
             Weight for Signal 1 (Attention Mass). Default 0.6.
         beta : float
-            Weight for Signal 2 (Forward Routing). Default 0.4.
+            Weight for Signal 2 (Backward-to-history routing). Default 0.4.
             Constraint: alpha + beta == 1.0 (enforced at runtime).
         window_size : int
             Number of recent tokens used as the observation window (w).
@@ -90,6 +91,9 @@ class DualSignalScorer:
         self.window_size = window_size
         self.num_layers = num_layers
         self.device = torch.device(device)
+        self.layer_weighting = str(layer_weighting).strip().lower()
+        if self.layer_weighting not in {"linear", "uniform"}:
+            raise ValueError("layer_weighting must be `linear` or `uniform`.")
 
         # Layer weights: w_l = l / sum(l') giving higher layers more weight.
         # Following PyramidKV's validated finding that higher layers carry
@@ -98,7 +102,11 @@ class DualSignalScorer:
         # allocation, not per-layer SCORE WEIGHTING. Applying it to scoring
         # is a reasonable hypothesis but is not empirically validated here.
         # Uniform weighting (num_layers=None) is provided as a clean ablation.
-        if num_layers is not None and num_layers > 0:
+        if (
+            self.layer_weighting == "linear"
+            and num_layers is not None
+            and num_layers > 0
+        ):
             layer_indices = torch.arange(1, num_layers + 1, dtype=torch.float32)
             self.layer_weights: Tensor = (layer_indices / layer_indices.sum()).to(self.device)
         else:

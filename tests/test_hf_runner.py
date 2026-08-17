@@ -7,6 +7,7 @@ from benchmarks.hf_runner import (
     DatasetSpec,
     build_prompt_from_record,
     load_dataset_records,
+    materialize_tokenizer_exact_niah_record,
     parse_dataset_spec,
     run_hf_grid,
     _run_eviction_method,
@@ -125,6 +126,38 @@ def test_niah_adapter_generates_controlled_context_and_prompt():
     assert gold == "KEY-000007"
     assert "Retrieve the secret key exactly." in prompt
     assert "Question: What is the secret retrieval key?" in prompt
+
+
+def test_niah_materialization_is_tokenizer_exact():
+    class WordTokenizer:
+        def __init__(self):
+            self.token_to_id = {}
+            self.id_to_token = {}
+
+        def __call__(self, text, **_kwargs):
+            ids = []
+            for token in str(text).split():
+                if token not in self.token_to_id:
+                    token_id = len(self.token_to_id)
+                    self.token_to_id[token] = token_id
+                    self.id_to_token[token_id] = token
+                ids.append(self.token_to_id[token])
+            return {"input_ids": ids}
+
+        def decode(self, token_ids, **_kwargs):
+            return " ".join(self.id_to_token[int(token_id)] for token_id in token_ids)
+
+    spec = parse_dataset_spec(
+        "source=niah,context_length=40,needle_depth=0.25,needle_prefix=KEY,seed=7"
+    )
+    record = load_dataset_records(spec, max_samples=1)[0]
+    tokenizer = WordTokenizer()
+    exact = materialize_tokenizer_exact_niah_record(record, tokenizer=tokenizer)
+
+    assert len(tokenizer(exact["context"])["input_ids"]) == 40
+    assert exact["actual_context_tokens"] == 40
+    assert exact["tokenizer_exact"] is True
+    assert 0.15 <= exact["actual_needle_depth"] <= 0.35
 
 
 def test_generic_dataset_prompt_path_still_uses_prompt_field_only():

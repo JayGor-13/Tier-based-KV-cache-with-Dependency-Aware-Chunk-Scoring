@@ -48,7 +48,14 @@ class SparseChunkDependencyGraph:
         )
 
     def route(self, chunk_relevance: torch.Tensor) -> torch.Tensor:
-        """Route key-chunk relevance back to chunks that depend on those keys."""
+        """Propagate current relevance backward to historical dependencies.
+
+        Graph rows are causal query-to-key edges: ``q -> r`` means chunk ``q``
+        attended to the older chunk ``r`` during prefill.  A currently relevant
+        chunk therefore lends relevance to the historical chunks on which it
+        depended.  The direct relevance is retained as a residual so a chunk
+        never loses its own evidence merely because it also has incoming edges.
+        """
         if chunk_relevance.ndim != 1:
             raise ValueError("chunk_relevance must be a 1D tensor.")
         if chunk_relevance.numel() != self.num_chunks:
@@ -64,15 +71,21 @@ class SparseChunkDependencyGraph:
         if self.top_k == 0:
             return relevance.clone()
 
-        safe_indices = indices.clamp_min(0)
-        gathered = relevance[safe_indices]
         valid_weights = torch.where(valid, weights, torch.zeros_like(weights))
-        weight_sum = valid_weights.sum(dim=1)
-        routed = (gathered * valid_weights).sum(dim=1)
-        routed = routed / weight_sum.clamp_min(torch.finfo(torch.float32).eps)
+        query_ids = torch.arange(
+            self.num_chunks,
+            dtype=torch.long,
+            device=relevance.device,
+        ).unsqueeze(1).expand_as(indices)
+        contributions = relevance[query_ids] * valid_weights
 
-        # Chunks without historical edges retain their direct relevance.
-        return torch.where(weight_sum > 0, routed, relevance)
+        routed = relevance.clone()
+        routed.scatter_add_(
+            0,
+            indices[valid],
+            contributions[valid],
+        )
+        return routed
 
 
 class SparseChunkDependencyGraphBuilder:
@@ -203,12 +216,16 @@ def aggregate_attention_rows(
     *,
     mode: str = "last",
     layer_index: int = -1,
+    layer_weighting: str = "linear",
 ) -> torch.Tensor:
     """Aggregate HF attention layers and heads into ``[queries, keys]`` rows."""
     if not attentions:
         raise ValueError("Model output did not include attentions.")
 
     mode = mode.lower()
+    layer_weighting = str(layer_weighting).strip().lower()
+    if layer_weighting not in {"linear", "uniform"}:
+        raise ValueError("layer_weighting must be `linear` or `uniform`.")
     layer_count = len(attentions)
     if mode == "last":
         idx = int(layer_index)
@@ -218,7 +235,11 @@ def aggregate_attention_rows(
             raise IndexError(f"layer_index {layer_index} is out of range.")
         selected = [(attentions[idx], 1.0)]
     elif mode == "all":
-        raw_weights = torch.arange(1, layer_count + 1, dtype=torch.float32)
+        raw_weights = (
+            torch.arange(1, layer_count + 1, dtype=torch.float32)
+            if layer_weighting == "linear"
+            else torch.ones(layer_count, dtype=torch.float32)
+        )
         raw_weights /= raw_weights.sum()
         selected = list(zip(attentions, raw_weights.tolist()))
     else:
@@ -254,6 +275,7 @@ def build_sparse_chunk_dependency_graph(
     top_k: int = 8,
     mode: str = "last",
     layer_index: int = -1,
+    layer_weighting: str = "linear",
     offload_to_cpu: bool = True,
 ) -> SparseChunkDependencyGraph:
     """Build a sparse graph from model attention outputs.
@@ -269,6 +291,7 @@ def build_sparse_chunk_dependency_graph(
         attentions,
         mode=mode,
         layer_index=layer_index,
+        layer_weighting=layer_weighting,
     )
     query_len, key_len = combined_rows.shape
     if query_len > chunk_map.numel() or key_len > chunk_map.numel():

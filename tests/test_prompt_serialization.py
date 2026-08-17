@@ -64,8 +64,9 @@ def test_prepare_prompt_applies_chat_template_with_generation_marker(serializati
         }
     ]
     assert tokenizer.tokenizer_calls[0][1]["add_special_tokens"] is False
-    assert tokenizer.tokenizer_calls[0][1]["truncation"] is True
-    assert tokenizer.tokenizer_calls[0][1]["max_length"] == 128
+    assert "truncation" not in tokenizer.tokenizer_calls[0][1]
+    assert prepared.original_token_count == 3
+    assert prepared.was_truncated is False
 
 
 def test_prepare_prompt_raw_mode_preserves_text_and_special_token_handling():
@@ -98,3 +99,25 @@ def test_prepare_prompt_rejects_unknown_serialization():
             prompt="prompt",
             serialization="conversation",
         )
+
+
+def test_prepare_prompt_records_and_applies_explicit_truncation_side():
+    class LongTokenizerFixture:
+        chat_template = None
+
+        def __call__(self, _text, **_kwargs):
+            ids = torch.arange(6).unsqueeze(0)
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+    prepared = prepare_prompt(
+        tokenizer=LongTokenizerFixture(),
+        prompt="long",
+        max_length=3,
+        serialization="raw",
+        truncation_side="left",
+    )
+
+    assert prepared.original_token_count == 6
+    assert prepared.was_truncated is True
+    assert prepared.truncation_side == "left"
+    assert prepared.input_ids.tolist() == [[3, 4, 5]]

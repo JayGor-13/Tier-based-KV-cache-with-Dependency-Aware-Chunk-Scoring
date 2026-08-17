@@ -36,7 +36,7 @@ def test_incremental_builder_keeps_top_inter_chunk_edges():
     assert torch.allclose(graph.edge_weights[1:], torch.ones(2, 1))
 
 
-def test_graph_routes_relevance_to_historical_dependents():
+def test_graph_routes_relevance_to_historical_dependencies():
     graph = SparseChunkDependencyGraph(
         neighbor_indices=torch.tensor([[-1], [0], [1]], dtype=torch.long),
         edge_weights=torch.tensor([[0.0], [1.0], [1.0]], dtype=torch.float32),
@@ -44,7 +44,7 @@ def test_graph_routes_relevance_to_historical_dependents():
 
     routed = graph.route(torch.tensor([1.0, 0.2, 0.1]))
 
-    assert torch.allclose(routed, torch.tensor([1.0, 1.0, 0.2]))
+    assert torch.allclose(routed, torch.tensor([1.2, 0.3, 0.1]))
 
 
 def test_routed_signal_changes_old_chunk_ranking():
@@ -123,6 +123,23 @@ def test_attention_row_aggregation_preserves_layer_modes():
 
     last_rows = aggregate_attention_rows([first, second], mode="last")
     all_rows = aggregate_attention_rows([first, second], mode="all")
+    uniform_rows = aggregate_attention_rows(
+        [first, second], mode="all", layer_weighting="uniform"
+    )
 
     assert torch.allclose(last_rows, torch.full((3, 4), 4.0))
     assert torch.allclose(all_rows, torch.full((3, 4), 3.0))
+    assert torch.allclose(uniform_rows, torch.full((3, 4), 2.5))
+
+
+def test_reverse_routing_rescues_historical_bridge_chunk():
+    graph = SparseChunkDependencyGraph(
+        neighbor_indices=torch.tensor([[-1], [0], [1]], dtype=torch.long),
+        edge_weights=torch.tensor([[0.0], [1.0], [1.0]], dtype=torch.float32),
+    )
+
+    # The final query directly values chunk 2. Its causal edge to chunk 1
+    # should protect that older bridge; relevance must not flow forward to 2.
+    routed = graph.route(torch.tensor([0.0, 0.0, 1.0]))
+
+    assert torch.allclose(routed, torch.tensor([0.0, 1.0, 1.0]))

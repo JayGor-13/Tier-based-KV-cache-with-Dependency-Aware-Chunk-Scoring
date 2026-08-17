@@ -570,6 +570,29 @@ def _numeric_field_summary(records: list[dict]) -> dict:
     }
 
 
+def _layerwise_kept_summary(records: list[dict]) -> dict:
+    profiles = [
+        record.get("layerwise_kept_tokens")
+        for record in records
+        if isinstance(record.get("layerwise_kept_tokens"), list)
+    ]
+    if not profiles:
+        return {"profile_count": 0, "layers": []}
+    layer_count = min(len(profile) for profile in profiles)
+    return {
+        "profile_count": len(profiles),
+        "layers": [
+            {
+                "layer": layer,
+                "avg_kept_tokens": _mean(float(profile[layer]) for profile in profiles),
+                "min_kept_tokens": min(float(profile[layer]) for profile in profiles),
+                "max_kept_tokens": max(float(profile[layer]) for profile in profiles),
+            }
+            for layer in range(layer_count)
+        ],
+    }
+
+
 def _budget_descriptors(run: dict, config: dict) -> list[dict]:
     specifications = config.get("budget_specifications")
     if isinstance(specifications, list) and specifications:
@@ -649,6 +672,8 @@ def aggregate_grouped_runs(runs: list[dict]) -> list[dict]:
         decode_records: list[dict] = []
         tier_records: list[dict] = []
         chunk_records: list[dict] = []
+        structural_records: list[dict] = []
+        runtime_records: list[dict] = []
 
         for run in successful:
             metric_payload = run.get("metrics")
@@ -708,6 +733,27 @@ def aggregate_grouped_runs(runs: list[dict]) -> list[dict]:
             }
             if chunk_record:
                 chunk_records.append(chunk_record)
+            if isinstance(run.get("structural_metrics"), dict):
+                structural_records.append(run["structural_metrics"])
+            runtime = run.get("runtime")
+            if isinstance(runtime, dict):
+                flat_runtime = {
+                    "total_measured_ms": runtime.get("total_measured_ms"),
+                    "max_peak_allocated_bytes": runtime.get(
+                        "max_peak_allocated_bytes"
+                    ),
+                    "max_peak_reserved_bytes": runtime.get(
+                        "max_peak_reserved_bytes"
+                    ),
+                    "decode_tokens_per_second": runtime.get(
+                        "decode_tokens_per_second"
+                    ),
+                }
+                for stage, stage_metrics in (runtime.get("stages") or {}).items():
+                    if isinstance(stage_metrics, dict):
+                        for field, value in stage_metrics.items():
+                            flat_runtime[f"{stage}_{field}"] = value
+                runtime_records.append(flat_runtime)
 
         error_types = Counter(str(run.get("error_type") or "UnknownError") for run in failed)
         dimensions = bucket["dimensions"]
@@ -736,6 +782,11 @@ def aggregate_grouped_runs(runs: list[dict]) -> list[dict]:
                 "decode_cache_summary": _numeric_field_summary(decode_records),
                 "tier_summary": _numeric_field_summary(tier_records),
                 "chunk_summary": _numeric_field_summary(chunk_records),
+                "structural_summary": _numeric_field_summary(structural_records),
+                "layer_retention_summary": _layerwise_kept_summary(
+                    structural_records
+                ),
+                "runtime_summary": _numeric_field_summary(runtime_records),
             }
         )
 

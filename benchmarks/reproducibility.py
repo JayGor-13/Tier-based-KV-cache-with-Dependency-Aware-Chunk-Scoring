@@ -15,14 +15,18 @@ import numpy as np
 import torch
 
 
-def seed_everything(seed: int) -> None:
-    """Seed supported random number generators without forcing slow kernels."""
+def seed_everything(seed: int, *, deterministic: bool = True) -> None:
+    """Seed supported RNGs and make paper runs determinism-auditable."""
     seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(bool(deterministic), warn_only=True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = bool(deterministic)
 
 
 def _package_version(name: str) -> str | None:
@@ -44,6 +48,24 @@ def _git_value(cwd: Path, arguments: list[str]) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return result.stdout.strip()
+
+
+def _nvidia_driver_version() -> str | None:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return values[0] if values else None
 
 
 def collect_environment_metadata(
@@ -81,17 +103,29 @@ def collect_environment_metadata(
                 "numpy",
                 "scipy",
                 "matplotlib",
+                "huggingface-hub",
             )
         },
         "cuda": {
             "available": bool(torch.cuda.is_available()),
             "torch_cuda_version": torch.version.cuda,
+            "driver_version": _nvidia_driver_version(),
             "cudnn_version": (
                 int(torch.backends.cudnn.version())
                 if torch.backends.cudnn.is_available()
                 else None
             ),
             "devices": gpu_devices,
+        },
+        "determinism": {
+            "deterministic_algorithms_enabled": bool(
+                torch.are_deterministic_algorithms_enabled()
+            ),
+            "deterministic_algorithms_warn_only": bool(
+                torch.is_deterministic_algorithms_warn_only_enabled()
+            ),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
         },
         "git": {
             "commit": _git_value(root, ["rev-parse", "HEAD"]),

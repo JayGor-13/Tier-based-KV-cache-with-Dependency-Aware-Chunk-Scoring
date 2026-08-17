@@ -14,7 +14,7 @@ from typing import Any, Sequence
 
 import torch
 
-from src.core.chunker import SentenceBoundaryChunkConstructor
+from src.core.chunker import FixedSizeChunkConstructor, SentenceBoundaryChunkConstructor
 from src.core.dependency_graph import (
     SparseChunkDependencyGraph,
     SparseChunkDependencyGraphBuilder,
@@ -41,6 +41,9 @@ class PreparedPrompt:
     rendered_text: str
     serialization: str
     model_inputs: dict[str, torch.Tensor]
+    original_token_count: int
+    was_truncated: bool
+    truncation_side: str
 
     @property
     def input_ids(self) -> torch.Tensor:
@@ -121,6 +124,8 @@ def resolve_torch_dtype(
 def load_hf_model_and_tokenizer(
     model_name: str,
     *,
+    revision: str | None = None,
+    token: str | None = None,
     device: str | torch.device = "auto",
     dtype: str = "auto",
     trust_remote_code: bool = False,
@@ -142,13 +147,16 @@ def load_hf_model_and_tokenizer(
     device_obj = resolve_device(device)
     torch_dtype = resolve_torch_dtype(dtype, device=device_obj)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, trust_remote_code=trust_remote_code
-    )
+    hub_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    if revision:
+        hub_kwargs["revision"] = revision
+    if token:
+        hub_kwargs["token"] = token
+    tokenizer = AutoTokenizer.from_pretrained(model_name, **hub_kwargs)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    model_kwargs: dict[str, Any] = dict(hub_kwargs)
     if torch_dtype is not None:
         model_kwargs["dtype"] = torch_dtype
     if attn_implementation:
@@ -195,6 +203,7 @@ def prepare_prompt(
     prompt: str,
     max_length: int | None = None,
     serialization: str = "auto",
+    truncation_side: str = "right",
 ) -> PreparedPrompt:
     """Render and tokenize a prompt once for every generation/cache path."""
     requested = str(serialization).strip().lower()
@@ -212,6 +221,11 @@ def prepare_prompt(
             "Chat prompt serialization was requested, but the tokenizer has no "
             "chat template. Use `raw` or a tokenizer with `apply_chat_template`."
         )
+    truncation_side = str(truncation_side).strip().lower()
+    if truncation_side not in {"left", "right"}:
+        raise ValueError("truncation_side must be `left` or `right`.")
+    if max_length is not None and int(max_length) <= 0:
+        raise ValueError("max_length must be positive when provided.")
 
     raw_text = str(prompt)
     if resolved == "chat":
@@ -229,8 +243,6 @@ def prepare_prompt(
         "return_tensors": "pt",
         "add_special_tokens": add_special_tokens,
     }
-    if max_length is not None:
-        tokenizer_kwargs.update({"truncation": True, "max_length": int(max_length)})
     encoded = tokenizer(rendered_text, **tokenizer_kwargs)
     model_inputs = {
         key: value.detach().cpu().clone()
@@ -242,12 +254,31 @@ def prepare_prompt(
         raise ValueError("Prepared prompts require tokenizer input_ids with batch size 1.")
     if input_ids.shape[1] == 0:
         raise ValueError("Prompt serialization produced no input tokens.")
+    original_token_count = int(input_ids.shape[1])
+    was_truncated = max_length is not None and original_token_count > int(max_length)
+    if was_truncated:
+        width = int(max_length)
+        model_inputs = {
+            key: (
+                value[..., -width:]
+                if truncation_side == "left"
+                and value.ndim >= 2
+                and value.shape[-1] == original_token_count
+                else value[..., :width]
+                if value.ndim >= 2 and value.shape[-1] == original_token_count
+                else value
+            )
+            for key, value in model_inputs.items()
+        }
 
     return PreparedPrompt(
         raw_text=raw_text,
         rendered_text=str(rendered_text),
         serialization=resolved,
         model_inputs=model_inputs,
+        original_token_count=original_token_count,
+        was_truncated=bool(was_truncated),
+        truncation_side=truncation_side,
     )
 
 
@@ -471,11 +502,14 @@ def run_hf_prefill(
     max_length: int | None = None,
     attention_mode: str = "last",
     layer_index: int = -1,
+    layer_weighting: str = "linear",
     min_chunk_tokens: int = 5,
     max_chunk_tokens: int = 64,
     dependency_top_k: int | None = 8,
     prefill_block_size: int = 128,
-    chunk_constructor: SentenceBoundaryChunkConstructor | None = None,
+    chunk_constructor: (
+        SentenceBoundaryChunkConstructor | FixedSizeChunkConstructor | None
+    ) = None,
     offload_to_cpu: bool = True,
     prepared_prompt: PreparedPrompt | None = None,
 ) -> HfPrefillRecord:
@@ -593,6 +627,7 @@ def run_hf_prefill(
                     attentions,
                     mode=attention_mode,
                     layer_index=layer_index,
+                    layer_weighting=layer_weighting,
                 )
                 graph_builder.update(
                     graph_rows,

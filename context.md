@@ -1,6 +1,6 @@
 # TDC-KV Repo Context
 
-Last maintained: 2026-08-05
+Last maintained: 2026-08-16
 
 ## Purpose
 
@@ -54,21 +54,43 @@ eviction with dependency-aware chunk scoring. The design details live in
    - Uses one-time raw/chat prompt serialization and records prompt/token hashes.
    - Includes the ChunkKV-compatible GSM8K eight-shot protocol and numeric judge.
    - Checks exact FullKV/custom-cache token parity before qualified experiments.
-   - Separates model load, generation, prefill, scoring, policy, and decode timing;
-     CUDA runs also record peak allocated and reserved VRAM.
+   - Uses a shared controlled prefill for FullKV/compressed comparisons and
+     separates method-specific scoring, policy, and decode timing; CUDA runs
+     record synchronized peak memory and physical KV tensor bytes.
    - Uses precomputed H2O/SnapKV scores, independent direct-attention ChunkKV
      scores, and a common decode policy for fair method comparisons.
-   - Records Python/package/CUDA/GPU/Git provenance and a deterministic grid
-     fingerprint.
+   - Records Python/package/CUDA/GPU/Git provenance, immutable model/dataset
+     revisions, and an environment-bound deterministic grid fingerprint.
    - Writes atomic per-run checkpoints and resumes only a matching experiment.
-   - Exposes `--require-qualified --require-cuda` as the final-run hard gate.
+   - Rejects prompt truncation, incomplete method/budget coverage, non-exact
+     NIAH, dirty Git state, failed target-model preflight, and unpinned inputs.
+
+7. Full paper experiment layer
+   - `scripts/run_paper_suite.py` defines qualification, tuning, a deterministic
+     final-quality pass, three timing repetitions, ablations, and combined
+     profiles with model/dataset/sample sharding.
+   - The combined profile selects the best macro-dataset tuning configuration,
+     freezes it in `selected_config.json`, and applies it to later jobs.
+   - Qualification/tuning/final samples come from disjoint frozen record-hash
+     partitions; NIAH contexts are exact in each target tokenizer.
+   - NIAH and HotpotQA rows include evidence token localization, evidence/chunk
+     survival, a global-mask evidence-token eviction proxy, evidence depth, and
+     head consensus. No true head/layer GER or layer allocation is claimed.
+   - Ablations cover fixed/token chunks, attention/routing balance, Tier 1,
+     sink/recent protection, and uniform/linear all-layer scoring.
+   - `scripts/preflight_hf_models.py` verifies Hub access and freezes immutable
+     model commits; loaded-model checks gate context, sliding cache, CUDA, and VRAM.
+   - `scripts/generate_paper_artifacts.py` validates qualified inputs and writes
+     aggregate CSV/JSON, Markdown tables, paired tests with Holm correction,
+     bootstrap confidence intervals, and paper figures.
 
 ## Fixed Issues
 
-- Module 2 forward routing over-boosted recent tokens under uniform attention
-  because `R_window` summed over heads while the out-of-window fallback used
-  `R=M`. Routing is now normalized by head count so uniform attention produces
-  uniform chunk scores.
+- Sparse graph rows are causal query-to-key edges. Routing now propagates
+  current relevance backward to historical dependencies with a direct-score
+  residual, rather than boosting a recent query from an old key's score.
+- The all-layer uniform ablation now assigns exactly equal layer weights;
+  linearly increasing weights remain a separate hypothesis.
 - Module 2 now moves observed attention and chunk indices to the scorer device
   before computation/indexing.
 - Module 2 now rejects negative and out-of-range chunk indices instead of

@@ -49,7 +49,7 @@ $\mathbf{C}$ and $\mathbf{Map}$ are passed immediately to **Module 2** to tell i
 **Parameters:**
 *   **$\alpha = 0.6$**, **$\beta = 0.4$** (Mixing coefficients).
 *   **$w = 16$** (Observation window length).
-*   **$\mathbf{L}_{weights}$**: `1D float tensor` across all layers where higher layers $> 1$ and lower layers $< 1$ (from PyramidKV insight).
+*   **$\mathbf{L}_{weights}$**: Optional normalized `1D float tensor` across all layers. The main hypothesis uses linearly increasing weights; the uniform ablation uses exactly $1/L$ for every layer.
 
 **Mathematical Transformation:**
 *   **Signal 1 (Attention Mass):** How much do the $w$ recent queries look at historical token $j$? 
@@ -58,10 +58,10 @@ $\mathbf{C}$ and $\mathbf{Map}$ are passed immediately to **Module 2** to tell i
 *   **Sparse Dependency Collection:** During prefill, aggregate each query chunk's attention into key-chunk mass. Remove the self-edge, retain the strongest $k$ edges, and normalize each sparse row:
     $$G[q,r] = \operatorname{mean}_{j \in C_q, h}\sum_{i \in C_r} A[h,j,i]$$
     $$\sum_{r \in N(q)} G[q,r] = 1, \quad |N(q)| \le k$$
-*   **Signal 2 (Historical Dependency Routing):** First aggregate direct attention mass into chunks, then route current relevance through historical dependencies:
+*   **Signal 2 (Historical Dependency Routing):** First aggregate direct attention mass into chunks, then propagate relevance backward along the causal query-to-key edges. If $q\rightarrow r$ means current/higher-position chunk $q$ attended to historical chunk $r$, then $q$ lends relevance to $r$:
     $$S_1[q] = \text{mean}(M[C_q])$$
-    $$S_2[q] = \sum_{r \in N(q)} G[q,r] \times \hat{S}_1[r]$$
-    Chunks without historical edges fall back to their direct relevance $\hat{S}_1[q]$.
+    $$S_2[r] = \hat{S}_1[r] + \sum_{q:\,r \in N(q)} G[q,r] \times \hat{S}_1[q]$$
+    The residual $\hat{S}_1[r]$ preserves every chunk's direct relevance; a historical bridge is boosted when currently relevant chunks depended on it.
 *   **Fusion:** Min-max normalize both to $[0,1]$, resulting in $\hat{S}_1$ and $\hat{S}_2$.
     $$\mathbf{Score_{chunk}}[k] = (\alpha \times \hat{S}_1[k]) + (\beta \times \hat{S}_2[k])$$
 

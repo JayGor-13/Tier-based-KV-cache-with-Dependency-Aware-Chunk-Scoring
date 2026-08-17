@@ -256,6 +256,74 @@ class SentenceBoundaryChunkConstructor:
         return normalized_chunks, new_chunk_map
 
 
+class FixedSizeChunkConstructor:
+    """Deterministic fixed-width constructor for chunking ablations."""
+
+    def __init__(
+        self,
+        chunk_size: int,
+        *,
+        device: str | torch.device = "cpu",
+    ) -> None:
+        if int(chunk_size) <= 0:
+            raise ValueError("chunk_size must be positive.")
+        self.chunk_size = int(chunk_size)
+        self.min_chunk_tokens = int(chunk_size)
+        self.max_chunk_tokens = int(chunk_size)
+        self.device = torch.device(device)
+
+    def forward(self, X: Tensor) -> tuple[list[Tensor], Tensor]:
+        if X.ndim != 1:
+            raise ValueError(f"Expected 1D tensor [t], got shape {tuple(X.shape)}.")
+        sequence_length = int(X.numel())
+        chunks = [
+            torch.arange(
+                start,
+                min(start + self.chunk_size, sequence_length),
+                dtype=torch.long,
+                device=self.device,
+            )
+            for start in range(0, sequence_length, self.chunk_size)
+        ]
+        chunk_map = torch.empty(
+            sequence_length,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for chunk_id, chunk in enumerate(chunks):
+            chunk_map[chunk] = chunk_id
+        return chunks, chunk_map
+
+    def update(
+        self,
+        chunks: list[Tensor],
+        chunk_map: Tensor,
+        new_token_id: int,
+        new_position: int,
+    ) -> tuple[list[Tensor], Tensor]:
+        del new_token_id
+        if new_position != int(chunk_map.numel()):
+            raise ValueError("new_position must equal the current sequence length.")
+        normalized = [chunk.to(self.device, dtype=torch.long) for chunk in chunks]
+        if not normalized or int(normalized[-1].numel()) >= self.chunk_size:
+            normalized.append(torch.empty(0, dtype=torch.long, device=self.device))
+        normalized[-1] = torch.cat(
+            [
+                normalized[-1],
+                torch.tensor([new_position], dtype=torch.long, device=self.device),
+            ]
+        )
+        updated_map = torch.cat(
+            [
+                chunk_map.to(self.device, dtype=torch.long),
+                torch.tensor(
+                    [len(normalized) - 1], dtype=torch.long, device=self.device
+                ),
+            ]
+        )
+        return normalized, updated_map
+
+
 def build_module1(
     tokenizer: Any,
     device: str | torch.device = "cpu",

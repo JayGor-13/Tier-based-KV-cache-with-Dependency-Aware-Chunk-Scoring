@@ -14,7 +14,7 @@ Papers used:
 - KVpop: learned fixed-budget predictive online pruning using future-attention supervision.
 - Understanding the Physics of KV Cache Compression: reachability-aware evaluation, Global Eviction Ratio, head consensus, and safety-cliff analysis.
 
-## Phase-1 Implementation Status (2026-08-05)
+## Paper-Readiness Implementation Status (2026-08-16)
 
 Implemented and regression-tested:
 
@@ -25,11 +25,41 @@ Implemented and regression-tested:
 - synchronized stage timing, peak CUDA memory, throughput, environment/Git
   provenance, deterministic run fingerprints, and atomic checkpoint/resume;
 - a hard paper-qualification gate for errors, parity, non-empty outputs,
-  measurements, CUDA availability, and matched budgets.
+  measurements, CUDA availability, matched budgets, complete grid coverage,
+  immutable revisions, clean Git state, exact NIAH, and no prompt truncation;
+- causal query-to-key routing corrected to propagate relevance backward to
+  historical dependencies, plus a true equal-weight all-layer ablation;
+- disjoint record-hash manifests for qualification, tuning, and final data;
+- Hugging Face authentication/revision preflight, loaded-model context/VRAM
+  checks, and model/dataset/sample-sharded resumable jobs;
+- corrected controlled runtime/KV-memory reporting and sample-level statistics
+  with bootstrap intervals and Holm-adjusted paired tests.
 
-Still belongs to later phases: official external baseline integrations,
-evidence/GER structural metrics, full 7B/8B GPU qualification, final dataset
-runs, statistical analysis, figures, and paper tables.
+Still belongs to execution/external validation: official external baseline
+integrations, full 7B/8B GPU qualification, final dataset runs, and paper-result
+interpretation.
+
+## Full-Scale Pipeline Status (2026-08-15)
+
+The repository now implements the complete local paper pipeline before GPU
+execution:
+
+- controlled GSM8K, HotpotQA, and multi-depth NIAH jobs;
+- six-method matched-budget deterministic final generation plus three dedicated
+  timing repetitions;
+- evidence localization, evidence/chunk survival, a global-mask evidence-token
+  eviction proxy, head consensus, and observed evidence depth;
+- scoring, chunking, tier-protection, and layer-weighting ablations;
+- isolated atomic checkpoints and one suite manifest;
+- strict artifact validation, aggregate CSV/Markdown tables, paired significance
+  tests, bootstrap confidence intervals, and all planned core figures.
+
+The remaining work is execution rather than local pipeline construction: freeze
+and commit the input manifests, verify one RTX-4050 small-model pipeline run,
+run tuning/final/timing/ablation shards on an A100-class runtime, and interpret
+the generated artifacts.
+Official third-party baseline repositories remain optional external validation;
+the bundled baseline implementations continue to be labeled approximations.
 
 ## 1. Core Claim To Prove
 
@@ -39,7 +69,7 @@ The paper should prove four claims:
 
 1. TDC-KV preserves downstream task quality at high KV compression.
 2. TDC-KV improves over token-level and chunk-level baselines under the same cache budget.
-3. The dual-signal scorer matters: attention mass alone is weaker than attention mass plus forward-routing dependency score.
+3. The dual-signal scorer matters: attention mass alone is weaker than attention mass plus backward-to-history dependency routing.
 4. Tier protection matters: hard-protecting sink and recent chunks prevents failure at aggressive compression.
 
 ## 2. Main Datasets
@@ -50,7 +80,7 @@ Use three primary datasets in the paper. These cover different stress types and 
 |---|---|---:|---|
 | GSM8K / Many-shot GSM8K | In-context mathematical reasoning, used by ChunkKV | Accuracy, Exact Match | Token F1, latency, memory |
 | Needle-In-A-Haystack (NIAH) | Long-context retrieval and positional robustness, used by ChunkKV and PyramidKV | Retrieval Accuracy | Depth-position heatmap score, F1 |
-| HotpotQA | Multi-hop reasoning and dependency preservation | Token F1, Exact Match | Answer-support reachability, GER |
+| HotpotQA | Multi-hop reasoning and dependency preservation | Token F1, Exact Match | Evidence-token retention and supporting-fact localization |
 
 Optional extension datasets:
 
@@ -151,7 +181,8 @@ These are important differentiators. Add them even if only for HotpotQA/NIAH and
 | Metric | Definition | Why it matters |
 |---|---|---|
 | Answer-token retention | Fraction of gold-answer/evidence tokens retained in the cache. | Shows whether evidence survives. |
-| Global Eviction Ratio (GER) | Fraction of answer-relevant tokens evicted across all heads/layers. | Predicts safety cliff and hallucination. |
+| Evidence-token eviction ratio (implemented proxy) | Fraction of localized evidence tokens removed by the one global position mask. | Auditable for the current shared-mask policy; do not call it head/layer reachability GER. |
+| True Global Eviction Ratio (deferred) | Fraction of answer-relevant tokens unreachable across every retained head/layer route. | Requires head/layer-specific retention that this implementation does not expose. |
 | Head consensus | Diversity of top-attended tokens across heads per layer. | Detects representational rigidity. |
 | Layer retention profile | Retained-token count per layer. | Shows whether TDC-KV behaves like or unlike PyramidKV. |
 | Tier distribution | Count/percentage of chunks in Tier 0, Tier 1, Tier 2. | Shows whether masking is doing meaningful work. |
@@ -220,8 +251,8 @@ Rows:
 
 | Variant | Description |
 |---|---|
-| TDC-KV full | Sentence chunks + attention mass + forward routing + tiers. |
-| No forward routing | `alpha=1.0`, `beta=0.0`; attention mass only. |
+| TDC-KV full | Sentence chunks + attention mass + historical dependency routing + tiers. |
+| No dependency routing | `alpha=1.0`, `beta=0.0`; attention mass only. |
 | Routing only | `alpha=0.0`, `beta=1.0`. |
 | No tiers | Rank chunks only; no Tier 1/2 protection. |
 | No sink protection | Remove sink hard-protection. |
@@ -233,7 +264,7 @@ Rows:
 
 Columns:
 
-| Variant | GSM8K Acc | NIAH Acc | HotpotQA F1 | Retention | GER | Latency ms |
+| Variant | GSM8K Acc | NIAH Acc | HotpotQA F1 | Retention | Evidence eviction | Decode ms/token |
 |---|---:|---:|---:|---:|---:|---:|
 
 ### Table 5: Parameter Sensitivity
@@ -315,7 +346,7 @@ Show stacked bars:
 
 Report per dataset or per representative sample.
 
-### Figure 4: Evidence Survival / GER vs Compression
+### Figure 4: Evidence Survival / Evidence-Token Eviction vs Compression
 
 Purpose: connect to the Physics paper and strengthen mechanistic analysis.
 
@@ -325,7 +356,7 @@ X-axis:
 
 Y-axis:
 
-- GER or answer-token eviction rate.
+- Global-mask evidence-token eviction rate.
 
 Lines:
 
@@ -336,7 +367,7 @@ Lines:
 
 Expected claim:
 
-- TDC-KV should have lower GER than token-level baselines at the same retention because whole dependency chunks preserve answer routes.
+- TDC-KV should have lower evidence-token eviction than token-level baselines at the same retention because whole dependency chunks preserve answer routes.
 
 ### Figure 5: Latency And VRAM
 
@@ -360,7 +391,7 @@ Y-axis:
 Bars:
 
 - Full TDC-KV.
-- No forward routing.
+- No dependency routing.
 - No tiers.
 - Fixed chunks.
 - Token-level eviction.
@@ -444,13 +475,13 @@ Needed additions:
 
 - Multi-method plotting, not only FullKV vs TDC-KV.
 - Dataset-specific plot grouping.
-- GER/evidence-retention plots.
+- Evidence-token eviction/retention plots.
 - NIAH heatmaps.
 - VRAM/throughput plots.
 
-## 9. Implementation Gaps Before Final Results
+## 9. Paper-Readiness Code Status
 
-The current codebase is a good prototype, but publication-quality comparison needs these additions:
+The following originally planned gaps are now implemented unless explicitly marked deferred:
 
 1. Add StreamingLLM baseline.
    - Keep first `sink_tokens` plus last `recent_window` tokens.
@@ -474,14 +505,16 @@ The current codebase is a good prototype, but publication-quality comparison nee
    - For NIAH: mark needle fact tokens as answer-critical.
    - For HotpotQA: mark answer string tokens and supporting-fact sentence tokens as answer-critical.
 
-6. Implement GER.
-   - For each answer-critical token, check whether it survives in any retained KV route.
-   - In current implementation, eviction is global across layers once cache is selected; if using all-layer cache, compute per-layer/head survival when possible.
-   - GER = number of globally evicted answer-critical tokens / number of answer-critical tokens.
+6. Implement the auditable structural metric.
+   - The code localizes answer-critical evidence and measures survival under the
+     shared global position mask.
+   - This is reported as `evidence_token_eviction_ratio`, not as true
+     head/layer reachability GER.
 
-7. Implement layerwise result logging.
-   - Needed for PyramidKV comparison and layer-weight ablation.
-   - Log kept counts per layer and attention-mode choice.
+7. True layerwise allocation/result logging is deferred.
+   - The current policy deliberately uses one shared mask for every layer.
+   - Uniform versus linear all-layer *scoring* is supported, but no PyramidKV-
+     style per-layer budget claim is made.
 
 8. Enforce exact-budget reporting.
    - TDC-KV uses whole-chunk ranking plus one partial boundary chunk to avoid granularity underfill.
@@ -531,7 +564,7 @@ Run:
 Expected:
 
 - Fixed chunks may work on retrieval but should degrade semantic QA/multi-hop.
-- Token-level should have higher fragmentation and higher GER.
+- Token-level should have higher fragmentation and evidence-token eviction.
 
 ### Ablation C: Tier Protection
 
@@ -592,7 +625,7 @@ Run retention ratios:
 Report:
 
 - Task score.
-- GER.
+- Evidence-token eviction ratio.
 - Hallucination rate.
 - Budget gap.
 
@@ -659,7 +692,7 @@ Use three repeats for final tables. Report mean plus standard deviation.
 
 4. Multi-Hop Dependency Preservation
    - HotpotQA results.
-   - GER/evidence survival plot.
+   - Evidence-token eviction/survival plot.
 
 5. Efficiency
    - Latency, throughput, VRAM.
@@ -677,19 +710,14 @@ Use three repeats for final tables. Report mean plus standard deviation.
 
 ## 14. Priority Execution Checklist
 
-1. Run unit tests and smoke trace scripts.
-2. Add StreamingLLM baseline.
-3. Extend HF grid to run all baselines through evicted-cache generation.
-4. Add VRAM and throughput logging.
-5. Add evidence-token retention and GER logging.
-6. Generate or prepare three dataset inputs: GSM8K, NIAH, HotpotQA.
-7. Run small grid on 50 samples.
-8. Choose final default parameters.
-9. Run full main experiments over 3 models x 3 datasets x 4 budgets x 6 methods.
-10. Generate result tables.
-11. Generate figures.
-12. Run ablations.
-13. Write failure analysis with example cases.
+1. Install the constrained environment and run the unified CPU test suite.
+2. Authenticate to Hugging Face and freeze immutable model revisions.
+3. Freeze and commit the disjoint dataset protocol manifest.
+4. Run one all-method, one-sample qualification job on the RTX 4050.
+5. On an A100-class runtime, run tuning and freeze the selected configuration.
+6. Resume the sharded final-quality, timing, and ablation jobs.
+7. Generate qualified artifacts, inspect statistical/efficiency tables, and
+   write failure analysis from the saved per-sample rows.
 
 ## 15. What To Claim Carefully
 
@@ -705,7 +733,7 @@ Avoid overclaiming:
 
 Best comparison framing:
 
-- Compared with ChunkKV, TDC-KV adds dependency-aware forward routing and tier protection.
+- Compared with ChunkKV, TDC-KV adds backward-to-history dependency routing and tier protection.
 - Compared with SnapKV/H2O, TDC-KV avoids isolated token pruning by preserving complete chunks.
 - Compared with PyramidKV, TDC-KV is not primarily a layer-budget method, but can incorporate layer-weighted scoring.
 - Compared with KVpop, TDC-KV is training-free and simpler, while KVpop is a learned future-attention method.

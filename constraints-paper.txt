@@ -1,0 +1,11 @@
+# Paper protocol software lock validated by the repository's CPU test suite.
+# Keep the CUDA-enabled PyTorch build supplied by the target runtime; its exact
+# torch/CUDA/cuDNN/driver tuple is recorded and gated in every result manifest.
+transformers==4.43.0
+datasets==5.0.0
+accelerate==1.14.0
+huggingface-hub==0.36.2
+numpy==2.4.6
+scipy==1.17.1
+matplotlib==3.11.0
+pytest==9.1.0
