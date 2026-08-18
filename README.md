@@ -147,6 +147,9 @@ bit-for-bit official reference implementations in the paper.
 
 ## Complete Paper Experiment Pipeline
 
+For the full command-by-command workflow and the exact specification of every
+experiment profile, see [`EXPERIMENT_RUNBOOK.md`](EXPERIMENT_RUNBOOK.md).
+
 First authenticate with a Hugging Face read token. Meta Llama also requires the
 account to have accepted the model license. In PowerShell:
 
@@ -172,7 +175,7 @@ Review and commit `protocol/model_revisions.json` and
 run a one-sample, all-method laptop qualification on the RTX 4050:
 
 ```bash
-python scripts/run_paper_suite.py --profile qualification --max-samples 1 --model-revisions-file protocol/model_revisions.json
+python scripts/run_paper_suite.py --profile qualification --methods tdc_kv --max-samples 1 --model-revisions-file protocol/model_revisions.json
 ```
 
 The 7B/8B eager-FP16 correctness path does not fit a 6 GB RTX 4050. Use an
@@ -180,7 +183,7 @@ A100-class Colab Pro runtime for tuning/final experiments, verify the GPU shown
 by `nvidia-smi`, and run the resumable sharded suite:
 
 ```bash
-python scripts/run_paper_suite.py --profile all --model-revisions-file protocol/model_revisions.json --sample-shards 10 --resume
+python scripts/run_paper_suite.py --profile all --methods tdc_kv --model-revisions-file protocol/model_revisions.json --sample-shards 10 --resume
 ```
 
 The `all` profile runs qualification, tuning, one deterministic final quality
@@ -189,14 +192,17 @@ pass, three independent timing repetitions, and ablations. Tuning writes
 split by model, dataset, and sample shard, with isolated atomic checkpoints.
 Use `--dry-run` to inspect generated commands and `--resume` after interruption.
 
-Once the result jobs finish, produce all CSV/Markdown tables, significance
-tests, and figures with:
+Once the result jobs finish, produce headline CSV/Markdown tables,
+significance tests, and figures with:
 
 ```bash
 python scripts/generate_paper_artifacts.py \
-  --inputs "outputs/paper/main_*.json" "outputs/paper/timing_*.json" "outputs/paper/ablation_*.json" \
-  --output-dir outputs/paper/artifacts
+  --inputs "outputs/paper/main_*.json" \
+  --output-dir outputs/paper/artifacts/main
 ```
+
+Generate timing and ablation artifacts separately as documented in the
+runbook; this avoids mixing final-partition quality with tuning-partition rows.
 
 The artifact builder refuses unqualified result files and records input hashes.
 Outputs include main results, quality curves, efficiency tables, paired

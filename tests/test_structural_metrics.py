@@ -21,6 +21,20 @@ class _WhitespaceTokenizer:
         return {"input_ids": ids}
 
 
+class _TrailingBoundaryTokenizer:
+    """Fixture whose evidence token changes when followed by whitespace."""
+
+    def __call__(self, text, **_kwargs):
+        values = {
+            "prefix Evidence suffix": [10, 20, 30],
+            "Evidence": [21],
+            " Evidence": [22],
+            "\nEvidence": [23],
+            "Evidence ": [20],
+        }
+        return {"input_ids": values.get(str(text), [99])}
+
+
 def test_niah_evidence_token_eviction_is_auditable():
     tokenizer = _WhitespaceTokenizer()
     prompt = "archive The secret retrieval key is KEY-7. record"
@@ -52,3 +66,14 @@ def test_head_consensus_reports_identical_heads_as_one():
     result = compute_head_consensus(attention, top_k=1)
     assert result["head_consensus"] == 1.0
     assert result["head_diversity"] == 0.0
+
+
+def test_evidence_locator_covers_context_sensitive_trailing_boundary():
+    targets = locate_evidence_targets(
+        tokenizer=_TrailingBoundaryTokenizer(),
+        input_ids=[10, 20, 30],
+        evidence_texts=["Evidence"],
+    )
+
+    assert targets.matched_texts == ("Evidence",)
+    assert targets.token_indices == (1,)

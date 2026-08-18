@@ -149,7 +149,15 @@ def locate_evidence_targets(
     matched: list[str] = []
     positions: set[int] = set()
     for text in requested:
-        variants = (text, " " + text, "\n" + text)
+        # Tokenizers are not guaranteed to tokenize a substring identically in
+        # isolation. In particular, byte-level/BPE tokenizers may merge the
+        # leading or trailing prompt delimiter into an adjacent token. Cover
+        # the boundary forms emitted by the controlled prompt serializers.
+        variants = tuple(
+            prefix + text + suffix
+            for prefix in ("", " ", "\n")
+            for suffix in ("", " ", "\n", "\n\n")
+        )
         found_for_text: set[int] = set()
         for variant in variants:
             pattern = _encode_without_special_tokens(tokenizer, variant)

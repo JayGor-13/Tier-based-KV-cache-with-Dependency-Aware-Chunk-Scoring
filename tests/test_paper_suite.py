@@ -34,3 +34,16 @@ def test_expensive_suite_jobs_split_by_model_dataset_and_sample_shard():
     assert len(expanded) == 2 * 5 * 2
     assert {args["sample-shard-count"] for _, args in expanded} == {2}
     assert {args["sample-shard-index"] for _, args in expanded} == {0, 1}
+
+
+def test_method_override_limits_every_profile_to_tdc_kv():
+    jobs = build_jobs(
+        "all",
+        models="one/model,two/model",
+        max_samples=1,
+        protocol_manifest="frozen.json",
+        methods="tdc_kv",
+    )
+
+    assert jobs
+    assert {arguments["methods"] for _, arguments in jobs} == {"tdc_kv"}

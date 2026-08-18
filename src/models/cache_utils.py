@@ -839,6 +839,17 @@ def generate_text_with_evicted_cache(
         position_ids = torch.tensor([[original_sequence_length]], dtype=torch.long, device=device)
 
         generated_tokens = [first_new_token_id]
+        configured_eos = getattr(
+            getattr(model, "generation_config", None), "eos_token_id", None
+        )
+        if configured_eos is None:
+            configured_eos = getattr(tokenizer, "eos_token_id", None)
+        if isinstance(configured_eos, (list, tuple, set)):
+            eos_token_ids = {int(token_id) for token_id in configured_eos}
+        elif configured_eos is None:
+            eos_token_ids = set()
+        else:
+            eos_token_ids = {int(configured_eos)}
         include_cache_position = (
             "cache_position" in inspect.signature(model.forward).parameters
         )
@@ -877,7 +888,9 @@ def generate_text_with_evicted_cache(
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
             generated_tokens.append(next_token.item())
             
-            if next_token.item() == tokenizer.eos_token_id:
+            # Match Transformers.generate(), which uses the model generation
+            # configuration and may define more than one EOS token.
+            if int(next_token.item()) in eos_token_ids:
                 break
                 
             input_ids = next_token

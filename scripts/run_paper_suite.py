@@ -150,6 +150,7 @@ def build_jobs(
     models: str,
     max_samples: int | None,
     protocol_manifest: str = "protocol/paper_dataset_manifest.json",
+    methods: str | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     jobs: list[tuple[str, dict[str, Any]]] = []
     if profile in {"qualification", "all"}:
@@ -274,6 +275,15 @@ def build_jobs(
             args["experiment-variant"] = name
             jobs.append((f"ablation_{name}", args))
 
+    if methods is not None:
+        requested_methods = ",".join(
+            method.strip() for method in methods.split(",") if method.strip()
+        )
+        if not requested_methods:
+            raise ValueError("At least one experiment method must be selected.")
+        for _, arguments in jobs:
+            arguments["methods"] = requested_methods
+
     return jobs
 
 
@@ -374,6 +384,14 @@ def main() -> None:
         default="main",
     )
     parser.add_argument("--models", default=DEFAULT_MODELS)
+    parser.add_argument(
+        "--methods",
+        default=None,
+        help=(
+            "Optional comma-separated method override for every selected profile. "
+            "Use --methods tdc_kv when baseline results already exist."
+        ),
+    )
     parser.add_argument("--model-revisions", default="")
     parser.add_argument(
         "--model-revisions-file",
@@ -446,6 +464,7 @@ def main() -> None:
         models=options.models,
         max_samples=options.max_samples,
         protocol_manifest=str(protocol_manifest),
+        methods=options.methods,
     )
     jobs = expand_jobs(
         jobs,
