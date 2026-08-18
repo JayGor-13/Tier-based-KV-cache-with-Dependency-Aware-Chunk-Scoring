@@ -1,0 +1,66 @@
+{
+  "models": {
+    "Qwen/Qwen2.5-0.5B-Instruct": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "Qwen/Qwen2.5-1.5B-Instruct": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    "meta-llama/Meta-Llama-3-8B-Instruct": "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
+    "mistralai/Mistral-7B-Instruct-v0.3": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+    "Qwen/Qwen2.5-7B-Instruct": "a09a35458c702b33eeacc393d103063234e8bc28"
+  },
+  "reports": [
+    {
+      "passed": true,
+      "issues": [],
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "requested_revision": null,
+      "resolved_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+      "authenticated": true,
+      "repository_weight_bytes": 988097824,
+      "gpu_total_memory_bytes": null,
+      "max_vram_fraction": 0.9
+    },
+    {
+      "passed": true,
+      "issues": [],
+      "model": "Qwen/Qwen2.5-1.5B-Instruct",
+      "requested_revision": null,
+      "resolved_revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+      "authenticated": true,
+      "repository_weight_bytes": 3087467144,
+      "gpu_total_memory_bytes": null,
+      "max_vram_fraction": 0.9
+    },
+    {
+      "passed": true,
+      "issues": [],
+      "model": "meta-llama/Meta-Llama-3-8B-Instruct",
+      "requested_revision": null,
+      "resolved_revision": "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
+      "authenticated": true,
+      "repository_weight_bytes": 16060556376,
+      "gpu_total_memory_bytes": null,
+      "max_vram_fraction": 0.9
+    },
+    {
+      "passed": true,
+      "issues": [],
+      "model": "mistralai/Mistral-7B-Instruct-v0.3",
+      "requested_revision": null,
+      "resolved_revision": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+      "authenticated": true,
+      "repository_weight_bytes": 28992159440,
+      "gpu_total_memory_bytes": null,
+      "max_vram_fraction": 0.9
+    },
+    {
+      "passed": true,
+      "issues": [],
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "requested_revision": null,
+      "resolved_revision": "a09a35458c702b33eeacc393d103063234e8bc28",
+      "authenticated": true,
+      "repository_weight_bytes": 15231271888,
+      "gpu_total_memory_bytes": null,
+      "max_vram_fraction": 0.9
+    }
+  ]
+}
