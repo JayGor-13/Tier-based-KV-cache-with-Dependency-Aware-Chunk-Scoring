@@ -224,7 +224,11 @@ def qualification_failures(
     if require_parity:
         parity = result.get("summary", {}).get("fullkv_parity", {})
         if parity.get("all_passed") is not True:
-            failures.append("FullKV/custom-cache generation parity did not pass")
+            mismatches = parity.get("mismatched_samples") or []
+            detail = f": {mismatches}" if mismatches else ""
+            failures.append(
+                "FullKV/custom-cache generation parity did not pass" + detail
+            )
 
     if require_cuda and not result.get("environment", {}).get("cuda", {}).get(
         "available", False
