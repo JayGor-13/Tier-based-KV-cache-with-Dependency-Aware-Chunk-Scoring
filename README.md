@@ -83,6 +83,87 @@ attention tensors. Result JSON records the configured size and actual block coun
 Long HuggingFace runs print live model, sample, prefill, and method/budget
 progress by default. Pass `--no-progress` only when quiet output is required.
 
+## Local 1-2B Paper Sweep
+
+Use this path for a laptop RTX 4000-series GPU. It reuses
+`scripts/run_hf_grid.py`, but standardizes a resumable local research layout for
+two 1-2B instruction models, GSM8K, HotPotQA, and NIAH:
+
+- default models: `Qwen/Qwen2.5-1.5B-Instruct` and
+  `HuggingFaceTB/SmolLM2-1.7B-Instruct`;
+- default datasets: GSM8K test, HotPotQA distractor validation, and NIAH at
+  10%, 50%, and 90% needle depths with a 3072-token local context;
+- default compression sweep: 75%, 50%, 25%, and 12.5% KV retention;
+- default algorithm parameters: `theta=0.3`, `recent_window=16`, `alpha=0.6`,
+  `dependency_top_k=8`, semantic chunks up to 64 tokens;
+- outputs: raw resumable JSON files plus CSV/JSON/Markdown summaries grouped by
+  model, dataset, method, algorithm parameters, and compression ratio.
+
+First run the tiny end-to-end smoke matrix:
+
+```bash
+python scripts/run_local_paper_suite.py --profile smoke --resume
+```
+
+Then run a main quality/compression sweep:
+
+```bash
+python scripts/run_local_paper_suite.py \
+  --profile main \
+  --max-samples 50 \
+  --sample-shards 5 \
+  --resume
+```
+
+Run the TDC-KV parameter sweep separately so it can be reported as an ablation
+table without mixing it with the default setting:
+
+```bash
+python scripts/run_local_paper_suite.py \
+  --profile param_sweep \
+  --max-samples 20 \
+  --sample-shards 5 \
+  --resume
+```
+
+The suite writes job files under `outputs/local_paper/` and summary artifacts
+under `outputs/local_paper/artifacts/`:
+
+- `algorithm_parameter_grid.csv`: spreadsheet-friendly paper table;
+- `algorithm_parameter_grid.json`: machine-readable aggregate table;
+- `algorithm_parameter_grid.md`: quick Markdown table for inspection;
+- `artifact_manifest.json`: input paths and SHA-256 hashes.
+
+To rebuild summaries after a manual or interrupted run:
+
+```bash
+python scripts/summarize_local_paper_results.py \
+  --inputs "outputs/local_paper/*.json" \
+  --output-dir outputs/local_paper/artifacts
+```
+
+For stricter paper provenance, resolve model revisions and optionally freeze a
+local dataset manifest before the final run:
+
+```bash
+python scripts/preflight_hf_models.py \
+  --models "Qwen/Qwen2.5-1.5B-Instruct,HuggingFaceTB/SmolLM2-1.7B-Instruct" \
+  --output protocol/local_model_revisions.json
+
+python scripts/run_local_paper_suite.py --freeze-manifest
+
+python scripts/run_local_paper_suite.py \
+  --profile main \
+  --model-revisions-file protocol/local_model_revisions.json \
+  --use-frozen-manifest \
+  --require-qualified \
+  --require-cuda \
+  --require-model-preflight \
+  --require-model-revision \
+  --require-no-truncation \
+  --resume
+```
+
 ## Paper Qualification Workflow
 
 The paper path now enforces the following contracts:
