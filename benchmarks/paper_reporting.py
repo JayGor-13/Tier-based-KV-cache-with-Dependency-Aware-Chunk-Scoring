@@ -8,6 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 import statistics
 import random
+import math
 from typing import Any, Iterable
 
 from benchmarks.eval_metrics import (
@@ -16,6 +17,8 @@ from benchmarks.eval_metrics import (
     niah_retrieval_match,
     token_f1,
 )
+from benchmarks.result_schema import assert_result_payload
+from benchmarks.qualification import recompute_declared_qualification
 
 
 METHOD_ORDER = ("fullkv", "streamingllm", "h2o", "snapkv", "chunkkv", "tdc_kv")
@@ -86,25 +89,94 @@ def _variant(run: dict[str, Any]) -> str:
     return "default"
 
 
-def load_paper_runs(paths: Iterable[str | Path]) -> list[dict[str, Any]]:
+def load_paper_runs(
+    paths: Iterable[str | Path],
+    *,
+    allow_unqualified: bool = False,
+) -> list[dict[str, Any]]:
     runs: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: dict[str, dict[str, Any]] = {}
     for path_value in paths:
         path = Path(path_value)
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if not allow_unqualified:
+            assert_result_payload(payload, require_complete=True)
+            qualification = recompute_declared_qualification(payload)
+            if qualification.get("passed") is not True:
+                raise ValueError(
+                    f"Result is not paper-qualified: {path}: "
+                    f"{qualification.get('failures')}"
+                )
         seed = int(payload.get("environment", {}).get("seed", payload.get("grid", {}).get("seed", 0)))
+        method_metadata = payload.get("method_metadata") or {}
         for index, raw in enumerate(payload.get("runs", [])):
             if raw.get("status") != "ok":
                 continue
-            identity = (str(raw.get("run_key") or path.resolve()), index if not raw.get("run_key") else 0)
-            if identity in seen:
+            identity = str(raw.get("run_key") or f"{path.resolve()}:{index}")
+            previous = seen.get(identity)
+            if previous is not None:
+                if previous != raw:
+                    raise ValueError(f"Conflicting duplicate run key: {identity}")
                 continue
-            seen.add(identity)
+            seen[identity] = dict(raw)
             run = dict(raw)
             run["_seed"] = seed
             run["_source_file"] = str(path)
+            run["_method_metadata"] = dict(
+                method_metadata.get(str(raw.get("method")), {})
+            )
             runs.append(run)
     return runs
+
+
+def wilson_interval(
+    successes: int,
+    total: int,
+    *,
+    z: float = 1.959963984540054,
+) -> tuple[float | None, float | None]:
+    """Wilson score interval for a binomial proportion."""
+    if total <= 0:
+        return None, None
+    proportion = successes / total
+    denominator = 1.0 + (z * z) / total
+    center = (proportion + (z * z) / (2.0 * total)) / denominator
+    radius = (
+        z
+        * math.sqrt(
+            proportion * (1.0 - proportion) / total
+            + (z * z) / (4.0 * total * total)
+        )
+        / denominator
+    )
+    return max(0.0, center - radius), min(1.0, center + radius)
+
+
+def _execution_contract(run: dict[str, Any]) -> str:
+    explicit = run.get("execution_contract_id")
+    if explicit:
+        return str(explicit)
+    config = run.get("config") or {}
+    fields = (
+        run.get("model_revision"),
+        run.get("protocol"),
+        run.get("prompt_serialization"),
+        config.get("dtype"),
+        config.get("attention_mode"),
+        config.get("layer_weighting"),
+        config.get("prefill_block_size"),
+        config.get("max_length"),
+        config.get("max_new_tokens"),
+        config.get("decode_policy"),
+    )
+    return json.dumps(fields, sort_keys=True, default=str)
+
+
+def _method_config(run: dict[str, Any]) -> str:
+    explicit = run.get("method_config_id")
+    if explicit:
+        return str(explicit)
+    return json.dumps(run.get("config") or {}, sort_keys=True, default=str)
 
 
 def _mean(values: Iterable[float | int | None]) -> float | None:
@@ -151,7 +223,7 @@ def _runtime_value(run: dict[str, Any], field: str) -> float | None:
 
 
 def aggregate_paper_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str, str, str, float], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str, float, str, str], list[dict[str, Any]]] = defaultdict(list)
     for run in runs:
         key = (
             str(run.get("model", "unknown")),
@@ -159,11 +231,21 @@ def aggregate_paper_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(run.get("method", "unknown")),
             _variant(run),
             _requested_ratio(run),
+            _execution_contract(run),
+            _method_config(run),
         )
         groups[key].append(run)
 
     rows: list[dict[str, Any]] = []
-    for (model, dataset, method, variant, ratio), group_runs in groups.items():
+    for (
+        model,
+        dataset,
+        method,
+        variant,
+        ratio,
+        execution_contract_id,
+        method_config_id,
+    ), group_runs in groups.items():
         per_sample_scores: dict[str, list[float]] = defaultdict(list)
         observed_seeds: set[int] = set()
         metric_name = "unavailable"
@@ -178,9 +260,21 @@ def aggregate_paper_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if values
         ]
         quality_ci_low, quality_ci_high = _bootstrap_mean_ci(sample_scores)
+        wilson_low = wilson_high = None
+        if _dataset_family(dataset) == "gsm8k":
+            successes = sum(1 for score in sample_scores if score >= 0.5)
+            wilson_low, wilson_high = wilson_interval(successes, len(sample_scores))
         metrics = [run.get("metrics") or {} for run in group_runs]
         structural = [run.get("structural_metrics") or {} for run in group_runs]
         cache_memory = [run.get("cache_memory") or {} for run in group_runs]
+        metadata = next(
+            (
+                run.get("_method_metadata")
+                for run in group_runs
+                if run.get("_method_metadata")
+            ),
+            {},
+        )
         rows.append(
             {
                 "model": model,
@@ -188,6 +282,11 @@ def aggregate_paper_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "dataset_family": _dataset_family(dataset),
                 "method": method,
                 "variant": variant,
+                "implementation": metadata.get("implementation"),
+                "reference_equivalence": metadata.get("reference_equivalence"),
+                "paper_claim_level": metadata.get("paper_claim_level"),
+                "execution_contract_id": execution_contract_id,
+                "method_config_id": method_config_id,
                 "retention_ratio": ratio,
                 "compression_ratio": 1.0 - ratio,
                 "compression_multiplier": 1.0 / ratio if ratio > 0 else None,
@@ -196,6 +295,8 @@ def aggregate_paper_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "quality_std": _std(sample_scores),
                 "quality_bootstrap_95ci_low": quality_ci_low,
                 "quality_bootstrap_95ci_high": quality_ci_high,
+                "quality_wilson_95ci_low": wilson_low,
+                "quality_wilson_95ci_high": wilson_high,
                 "seeds": len(observed_seeds),
                 "samples": len(sample_scores),
                 "repetitions": len(group_runs),
@@ -286,6 +387,24 @@ def aggregate_paper_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ),
             }
         )
+    fullkv_quality = {
+        (row["model"], row["dataset"], row["execution_contract_id"]): row[
+            "quality_mean"
+        ]
+        for row in rows
+        if row["method"] == "fullkv" and row["quality_mean"] is not None
+    }
+    for row in rows:
+        reference = fullkv_quality.get(
+            (row["model"], row["dataset"], row["execution_contract_id"])
+        )
+        quality = row.get("quality_mean")
+        row["normalized_quality_ratio"] = (
+            100.0 * float(quality) / float(reference)
+            if quality is not None and reference not in {None, 0.0}
+            else None
+        )
+
     method_rank = {method: index for index, method in enumerate(METHOD_ORDER)}
     return sorted(
         rows,
@@ -301,7 +420,9 @@ def aggregate_paper_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def paired_significance_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Paired tests over unique samples, collapsing deterministic repetitions."""
-    repeated: dict[tuple[str, str, float, str, str], list[float]] = defaultdict(list)
+    repeated: dict[
+        tuple[str, str, float, str, str, str, str], list[float]
+    ] = defaultdict(list)
     for run in runs:
         if run.get("method") == "tdc_kv" and _variant(run) != "default":
             continue
@@ -312,8 +433,10 @@ def paired_significance_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]
             str(run.get("model")),
             str(run.get("dataset")),
             _requested_ratio(run),
+            _execution_contract(run),
             str(run.get("sample_id")),
             str(run.get("method")),
+            _method_config(run),
         )
         repeated[key].append(float(score))
     scored = {
@@ -323,84 +446,125 @@ def paired_significance_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]
     comparisons: list[dict[str, Any]] = []
     base_dimensions = sorted(
         {
-            (model, dataset, ratio)
-            for model, dataset, ratio, _sample, method in scored
+            (model, dataset, ratio, contract, method_config)
+            for model, dataset, ratio, contract, _sample, method, method_config in scored
             if method == "tdc_kv"
         }
     )
-    for model, dataset, ratio in base_dimensions:
+    for model, dataset, ratio, contract, tdc_method_config in base_dimensions:
         for baseline in METHOD_ORDER:
             if baseline in {"tdc_kv", "fullkv"}:
                 continue
-            pairs: list[tuple[float, float]] = []
-            for key, tdc_score in scored.items():
-                key_model, key_dataset, key_ratio, sample, method = key
-                if (
-                    method != "tdc_kv"
-                    or key_model != model
-                    or key_dataset != dataset
-                    or key_ratio != ratio
-                ):
-                    continue
-                baseline_score = scored.get(
-                    (model, dataset, ratio, sample, baseline)
-                )
-                if baseline_score is not None:
-                    pairs.append((tdc_score, baseline_score))
-            if not pairs:
-                continue
-            deltas = [tdc - base for tdc, base in pairs]
-            delta_mean = _mean(deltas) or 0.0
-            delta_std = _std(deltas)
-            rng = random.Random(42)
-            bootstrap = []
-            for _ in range(2000):
-                sampled = [deltas[rng.randrange(len(deltas))] for _ in deltas]
-                bootstrap.append(sum(sampled) / len(sampled))
-            bootstrap.sort()
-            lower = bootstrap[int(0.025 * (len(bootstrap) - 1))]
-            upper = bootstrap[int(0.975 * (len(bootstrap) - 1))]
-            wilcoxon_p = None
-            paired_t_p = None
-            try:
-                from scipy.stats import ttest_rel, wilcoxon
-
-                if any(abs(delta) > 0 for delta in deltas):
-                    wilcoxon_p = float(
-                        wilcoxon(
-                            [pair[0] for pair in pairs],
-                            [pair[1] for pair in pairs],
-                        ).pvalue
-                    )
-                else:
-                    wilcoxon_p = 1.0
-                if len(pairs) > 1 and delta_std > 0:
-                    paired_t_p = float(
-                        ttest_rel(
-                            [pair[0] for pair in pairs],
-                            [pair[1] for pair in pairs],
-                        ).pvalue
-                    )
-            except (ImportError, ValueError, ZeroDivisionError):
-                pass
-            comparisons.append(
+            baseline_configs = sorted(
                 {
-                    "model": model,
-                    "dataset": dataset,
-                    "retention_ratio": ratio,
-                    "baseline": baseline,
-                    "pairs": len(pairs),
-                    "tdc_mean": _mean(pair[0] for pair in pairs),
-                    "baseline_mean": _mean(pair[1] for pair in pairs),
-                    "mean_delta": delta_mean,
-                    "delta_std": delta_std,
-                    "cohens_dz": delta_mean / delta_std if delta_std > 0 else None,
-                    "bootstrap_95ci_low": lower,
-                    "bootstrap_95ci_high": upper,
-                    "wilcoxon_p": wilcoxon_p,
-                    "paired_t_p": paired_t_p,
+                    method_config
+                    for (
+                        key_model,
+                        key_dataset,
+                        key_ratio,
+                        key_contract,
+                        _sample,
+                        method,
+                        method_config,
+                    ) in scored
+                    if method == baseline
+                    and key_model == model
+                    and key_dataset == dataset
+                    and key_ratio == ratio
+                    and key_contract == contract
                 }
             )
+            for baseline_method_config in baseline_configs:
+                pairs: list[tuple[float, float]] = []
+                for key, tdc_score in scored.items():
+                    (
+                        key_model,
+                        key_dataset,
+                        key_ratio,
+                        key_contract,
+                        sample,
+                        method,
+                        key_method_config,
+                    ) = key
+                    if (
+                        method != "tdc_kv"
+                        or key_method_config != tdc_method_config
+                        or key_model != model
+                        or key_dataset != dataset
+                        or key_ratio != ratio
+                        or key_contract != contract
+                    ):
+                        continue
+                    baseline_score = scored.get(
+                        (
+                            model,
+                            dataset,
+                            ratio,
+                            contract,
+                            sample,
+                            baseline,
+                            baseline_method_config,
+                        )
+                    )
+                    if baseline_score is not None:
+                        pairs.append((tdc_score, baseline_score))
+                if not pairs:
+                    continue
+                deltas = [tdc - base for tdc, base in pairs]
+                delta_mean = _mean(deltas) or 0.0
+                delta_std = _std(deltas)
+                rng = random.Random(42)
+                bootstrap = []
+                for _ in range(2000):
+                    sampled = [deltas[rng.randrange(len(deltas))] for _ in deltas]
+                    bootstrap.append(sum(sampled) / len(sampled))
+                bootstrap.sort()
+                lower = bootstrap[int(0.025 * (len(bootstrap) - 1))]
+                upper = bootstrap[int(0.975 * (len(bootstrap) - 1))]
+                wilcoxon_p = None
+                paired_t_p = None
+                try:
+                    from scipy.stats import ttest_rel, wilcoxon
+
+                    if any(abs(delta) > 0 for delta in deltas):
+                        wilcoxon_p = float(
+                            wilcoxon(
+                                [pair[0] for pair in pairs],
+                                [pair[1] for pair in pairs],
+                            ).pvalue
+                        )
+                    else:
+                        wilcoxon_p = 1.0
+                    if len(pairs) > 1 and delta_std > 0:
+                        paired_t_p = float(
+                            ttest_rel(
+                                [pair[0] for pair in pairs],
+                                [pair[1] for pair in pairs],
+                            ).pvalue
+                        )
+                except (ImportError, ValueError, ZeroDivisionError):
+                    pass
+                comparisons.append(
+                    {
+                        "model": model,
+                        "dataset": dataset,
+                        "retention_ratio": ratio,
+                        "execution_contract_id": contract,
+                        "tdc_method_config_id": tdc_method_config,
+                        "baseline": baseline,
+                        "baseline_method_config_id": baseline_method_config,
+                        "pairs": len(pairs),
+                        "tdc_mean": _mean(pair[0] for pair in pairs),
+                        "baseline_mean": _mean(pair[1] for pair in pairs),
+                        "mean_delta": delta_mean,
+                        "delta_std": delta_std,
+                        "cohens_dz": delta_mean / delta_std if delta_std > 0 else None,
+                        "bootstrap_95ci_low": lower,
+                        "bootstrap_95ci_high": upper,
+                        "wilcoxon_p": wilcoxon_p,
+                        "paired_t_p": paired_t_p,
+                    }
+                )
     for source, destination in (
         ("wilcoxon_p", "wilcoxon_p_holm"),
         ("paired_t_p", "paired_t_p_holm"),
@@ -447,18 +611,19 @@ def write_markdown_tables(rows: list[dict[str, Any]], output_dir: str | Path) ->
         row
         for row in rows
         if row["method"] == "fullkv"
-        or abs(row["retention_ratio"] - 0.25) < 1e-9
+        or abs(row["retention_ratio"] - 0.20) < 1e-9
     ]
     lines = [
-        "# Main Results at 25% KV Retention",
+        "# Main Results at 20% KV Retention",
         "",
-        "| Model | Dataset | Method | Variant | Quality (mean ± std) | Tokens/s | Peak VRAM GiB | Evidence eviction |",
-        "|---|---|---|---|---:|---:|---:|---:|",
+        "| Model | Dataset | Method | Fidelity | Variant | Quality (mean ± std) | Tokens/s | Peak VRAM GiB | Evidence eviction |",
+        "|---|---|---|---|---|---:|---:|---:|---:|",
     ]
     for row in headline:
         quality = f"{_format(row['quality_mean'])} ± {_format(row['quality_std'])}"
         lines.append(
-            f"| {row['model']} | {row['dataset']} | {row['method']} | {row['variant']} | {quality} | "
+            f"| {row['model']} | {row['dataset']} | {row['method']} | "
+            f"{row.get('reference_equivalence') or 'unknown'} | {row['variant']} | {quality} | "
             f"{_format(row['decode_tokens_per_second'], 2)} | {_format(row['peak_vram_gib'], 2)} | "
             f"{_format(row['evidence_token_eviction_ratio'])} |"
         )
@@ -584,7 +749,7 @@ def generate_figures(rows: list[dict[str, Any]], output_dir: str | Path) -> None
         row
         for row in rows
         if row["method"] == "fullkv"
-        or abs(row["retention_ratio"] - 0.25) < 1e-9
+        or abs(row["retention_ratio"] - 0.20) < 1e-9
     ]
     if efficiency_rows:
         labels = [f"{row['method']}\n{row['dataset']}" for row in efficiency_rows]
@@ -640,7 +805,7 @@ def generate_figures(rows: list[dict[str, Any]], output_dir: str | Path) -> None
         for row in rows
         if row["method"] == "tdc_kv"
         and row["tier0_chunks"] is not None
-        and abs(row["retention_ratio"] - 0.25) < 1e-9
+        and abs(row["retention_ratio"] - 0.20) < 1e-9
     ]
     if tier_rows:
         labels = [f"{row['dataset']}\n{row['variant']}" for row in tier_rows]
@@ -664,7 +829,7 @@ def generate_figures(rows: list[dict[str, Any]], output_dir: str | Path) -> None
         for row in rows
         if row["method"] == "tdc_kv"
         and row["variant"] != "default"
-        and abs(row["retention_ratio"] - 0.25) < 1e-9
+        and abs(row["retention_ratio"] - 0.20) < 1e-9
         and row["quality_mean"] is not None
     ]
     if ablation_rows:
@@ -683,6 +848,7 @@ __all__ = [
     "generate_figures",
     "load_paper_runs",
     "paired_significance_rows",
+    "wilson_interval",
     "write_csv",
     "write_markdown_tables",
 ]

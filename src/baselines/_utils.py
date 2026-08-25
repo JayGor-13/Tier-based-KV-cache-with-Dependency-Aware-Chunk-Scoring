@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from src.core.numerical import require_finite_tensor
+
 from src.core.evictor import (
     EvictionResult,
     compute_budget_status,
@@ -39,6 +41,7 @@ def topk_from_candidates(
     k: int,
 ) -> torch.Tensor:
     """Return `k` token indices among candidates with largest score."""
+    require_finite_tensor("baseline_scores", scores, stage="baseline_topk")
     if k <= 0:
         return torch.empty(0, dtype=torch.long, device=scores.device)
 
@@ -58,6 +61,7 @@ def trim_keep_mask_to_budget(
     budget: int,
 ) -> torch.Tensor:
     """Drop the lowest-scored kept tokens until the mask respects budget."""
+    require_finite_tensor("baseline_scores", scores, stage="baseline_trim")
     target_keep = max(0, min(int(budget), int(keep_mask.numel())))
     current_keep = int(keep_mask.sum().item())
     if current_keep <= target_keep:
@@ -77,6 +81,7 @@ def resize_keep_mask_to_budget(
     budget: int,
 ) -> torch.Tensor:
     """Resize a keep mask to the exact usable budget using token scores."""
+    require_finite_tensor("baseline_scores", scores, stage="baseline_resize")
     keep_mask = trim_keep_mask_to_budget(keep_mask, scores, budget)
     target_keep = max(0, min(int(budget), int(keep_mask.numel())))
     current_keep = int(keep_mask.sum().item())

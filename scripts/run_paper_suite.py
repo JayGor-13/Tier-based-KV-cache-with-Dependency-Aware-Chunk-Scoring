@@ -24,10 +24,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.tuning import select_from_file
+from benchmarks.experiment_identity import identity_sha256
+from benchmarks.io_utils import write_json_atomic
+from benchmarks.qualification import recompute_declared_qualification
+from benchmarks.result_schema import assert_result_payload
 DEFAULT_MODELS = (
     "meta-llama/Meta-Llama-3-8B-Instruct,"
     "mistralai/Mistral-7B-Instruct-v0.3,"
-    "Qwen/Qwen2.5-7B-Instruct"
+    "Qwen/Qwen2-7B-Instruct"
 )
 METHODS = "fullkv,streamingllm,h2o,snapkv,chunkkv,tdc_kv"
 MAIN_DATASETS = ";".join(
@@ -48,14 +52,26 @@ MAIN_DATASETS = ";".join(
 )
 QUALIFICATION_DATASETS = ";".join(
     (
-        "name=gsm8k,source=openai/gsm8k,config=main,split=test,"
+        "name=gsm8k_qualification,source=openai/gsm8k,config=main,split=train,"
         "adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,"
         "prompt_field=question,answer_field=answer",
-        "name=hotpotqa,source=hotpotqa/hotpot_qa,config=distractor,"
-        "split=validation,adapter=hotpotqa,prompt_field=question,"
+        "name=hotpotqa_qualification,source=hotpotqa/hotpot_qa,config=distractor,"
+        "split=train,adapter=hotpotqa,prompt_field=question,"
         "answer_field=answer,id_field=id",
-        "name=niah_1k_d50,source=niah,adapter=niah,context_length=1024,"
+        "name=niah_qualification_1k_d50,source=niah,adapter=niah,context_length=1024,"
         "needle_depth=0.5,seed=29",
+    )
+)
+TUNING_DATASETS = ";".join(
+    (
+        "name=gsm8k_tuning,source=openai/gsm8k,config=main,split=train,"
+        "adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,"
+        "prompt_field=question,answer_field=answer",
+        "name=hotpotqa_tuning,source=hotpotqa/hotpot_qa,config=distractor,"
+        "split=train,adapter=hotpotqa,prompt_field=question,"
+        "answer_field=answer,id_field=id",
+        "name=niah_tuning_8k_d50,source=niah,adapter=niah,context_length=8192,"
+        "needle_depth=0.5,seed=71",
     )
 )
 ABLATION_DATASETS = ";".join(
@@ -66,6 +82,11 @@ ABLATION_DATASETS = ";".join(
         "name=niah_8k_d50,source=niah,adapter=niah,context_length=8192,"
         "needle_depth=0.5,seed=29",
     )
+)
+GSM8K_FULL_DATASET = (
+    "name=gsm8k_full,source=openai/gsm8k,config=main,split=test,"
+    "adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,"
+    "prompt_field=question,answer_field=answer"
 )
 
 
@@ -113,7 +134,7 @@ def _base_args(*, models: str, datasets: str, samples: int) -> dict[str, Any]:
         "models": models,
         "datasets": datasets,
         "methods": METHODS,
-        "budget-ratios": "0.5,0.25,0.125,0.0625",
+        "budget-ratios": "0.3,0.2,0.1",
         "thetas": "0.3",
         "recent-windows": "16",
         "alphas": "0.6",
@@ -123,15 +144,15 @@ def _base_args(*, models: str, datasets: str, samples: int) -> dict[str, Any]:
         "prefill-block-size": 32,
         "max-samples": samples,
         "max-length": 9216,
-        "max-new-tokens": 128,
+        "max-new-tokens": 512,
         "device": "cuda",
-        "dtype": "float16",
-        "attention-mode": "last",
+        "dtype": "bfloat16",
+        "attention-mode": "all",
         "layer-weighting": "linear",
         "decode-policy": "common_streaming",
-        "prompt-serialization": "auto",
+        "prompt-serialization": "raw",
         "truncation-side": "right",
-        "parity-max-samples": 1,
+        "parity-max-samples": 10,
         "require-qualified": True,
         "require-cuda": True,
         "require-frozen-manifest": True,
@@ -155,23 +176,23 @@ def build_jobs(
     jobs: list[tuple[str, dict[str, Any]]] = []
     if profile in {"qualification", "all"}:
         args = _base_args(
-            models="Qwen/Qwen2.5-0.5B-Instruct",
+            models=models,
             datasets=_attach_frozen_partition(
                 QUALIFICATION_DATASETS,
                 manifest=protocol_manifest,
                 partition="qualification",
             ),
-            samples=max_samples or 5,
+            samples=max_samples or 10,
         )
         args.update(
             {
                 "budget-ratios": "0.5,0.25",
                 "max-length": 2048,
-                "max-new-tokens": 64,
+                "max-new-tokens": 512,
                 "methods": METHODS,
                 "prefill-block-size": 16,
                 "seed": 42,
-                "experiment-variant": "default",
+                "experiment-variant": "qualification",
             }
         )
         jobs.append(("qualification", args))
@@ -180,7 +201,7 @@ def build_jobs(
         args = _base_args(
             models=models.split(",")[0],
             datasets=_attach_frozen_partition(
-                MAIN_DATASETS,
+                TUNING_DATASETS,
                 manifest=protocol_manifest,
                 partition="tuning",
             ),
@@ -189,7 +210,7 @@ def build_jobs(
         args.update(
             {
                 "methods": "fullkv,tdc_kv",
-                "budget-ratios": "0.25,0.125",
+                "budget-ratios": "0.3,0.1",
                 "thetas": "0.2,0.3,0.4",
                 "recent-windows": "16,32",
                 "alphas": "0.25,0.5,0.6,0.75,1.0",
@@ -211,6 +232,25 @@ def build_jobs(
         )
         args.update({"seed": 42, "experiment-variant": "default"})
         jobs.append(("main", args))
+
+    if profile == "gsm8k_full":
+        args = _base_args(
+            models=models,
+            datasets=_attach_frozen_partition(
+                GSM8K_FULL_DATASET,
+                manifest=protocol_manifest,
+                partition="final",
+            ),
+            samples=max_samples or 1319,
+        )
+        args.update(
+            {
+                "max-length": 2048,
+                "seed": 42,
+                "experiment-variant": "gsm8k_full",
+            }
+        )
+        jobs.append(("gsm8k_full", args))
 
     if profile in {"timing", "all"}:
         for repetition, seed in enumerate((13, 42, 101), start=1):
@@ -297,7 +337,9 @@ def expand_jobs(
     """Split expensive execution profiles into independently resumable jobs."""
     expanded: list[tuple[str, dict[str, Any]]] = []
     for name, arguments in jobs:
-        expensive = name == "main" or name.startswith(("timing_", "ablation_"))
+        expensive = name in {"main", "gsm8k_full"} or name.startswith(
+            ("timing_", "ablation_")
+        )
         if not expensive:
             expanded.append((name, arguments))
             continue
@@ -380,7 +422,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--profile",
-        choices=("qualification", "tuning", "main", "timing", "ablations", "all"),
+        choices=(
+            "qualification",
+            "tuning",
+            "main",
+            "gsm8k_full",
+            "timing",
+            "ablations",
+            "all",
+        ),
         default="main",
     )
     parser.add_argument("--models", default=DEFAULT_MODELS)
@@ -431,7 +481,12 @@ def main() -> None:
     protocol_manifest = Path(options.protocol_manifest).resolve()
     if options.freeze_manifest:
         unique_specs: dict[str, str] = {}
-        for specification in f"{QUALIFICATION_DATASETS};{MAIN_DATASETS}".split(";"):
+        freeze_datasets = (
+            GSM8K_FULL_DATASET
+            if options.profile == "gsm8k_full"
+            else f"{QUALIFICATION_DATASETS};{TUNING_DATASETS};{MAIN_DATASETS}"
+        )
+        for specification in freeze_datasets.split(";"):
             name = _dataset_name(specification)
             previous = unique_specs.get(name)
             if previous is not None and previous != specification:
@@ -445,6 +500,8 @@ def main() -> None:
             "--output",
             str(protocol_manifest),
         ]
+        if options.profile == "gsm8k_full":
+            freeze_command.extend(("--partitions", "final=1319"))
         completed = subprocess.run(freeze_command, cwd=ROOT, check=False)
         if completed.returncode != 0:
             raise SystemExit(completed.returncode)
@@ -514,16 +571,25 @@ def main() -> None:
         "jobs": [],
     }
     for job_name, arguments in jobs:
+        job_request_id = identity_sha256(arguments)
+        arguments["orchestration-job-id"] = job_request_id
         output = output_root / f"{job_name}.json"
-        checkpoint = output_root / f"{job_name}.checkpoint.json"
+        checkpoint = output_root / f"{job_name}.checkpoint.sqlite"
+        legacy_checkpoint = output_root / f"{job_name}.checkpoint.json"
+        if options.resume and not checkpoint.exists() and legacy_checkpoint.exists():
+            checkpoint = legacy_checkpoint
         if options.resume and output.exists():
             existing = json.loads(output.read_text(encoding="utf-8"))
-            qualified = (
-                existing.get("summary", {})
-                .get("qualification", {})
-                .get("passed")
-                is True
-            )
+            qualified = False
+            try:
+                assert_result_payload(existing, require_complete=True)
+                recomputed = recompute_declared_qualification(existing)
+                qualified = (
+                    recomputed.get("passed") is True
+                    and existing.get("orchestration_job_id") == job_request_id
+                )
+            except (TypeError, ValueError):
+                qualified = False
             if qualified:
                 job_record = {
                     "name": job_name,
@@ -539,9 +605,7 @@ def main() -> None:
                     _apply_selected_configuration(jobs, selected_configuration)
                     manifest["selected_configuration"] = selected_configuration
                     manifest["selected_config_path"] = str(selected_path)
-                (output_root / "suite_manifest.json").write_text(
-                    json.dumps(manifest, indent=2), encoding="utf-8"
-                )
+                write_json_atomic(output_root / "suite_manifest.json", manifest)
                 print(f"\n[{job_name}] already complete; skipping.", flush=True)
                 continue
         command = _command(
@@ -561,17 +625,13 @@ def main() -> None:
             "status": "planned" if options.dry_run else "running",
         }
         manifest["jobs"].append(job_record)
-        (output_root / "suite_manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+        write_json_atomic(output_root / "suite_manifest.json", manifest)
         if options.dry_run:
             continue
         completed = subprocess.run(command, cwd=ROOT, check=False)
         job_record["return_code"] = int(completed.returncode)
         job_record["status"] = "complete" if completed.returncode == 0 else "failed"
-        (output_root / "suite_manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+        write_json_atomic(output_root / "suite_manifest.json", manifest)
         if completed.returncode != 0:
             raise SystemExit(completed.returncode)
         if job_name == "tuning" and options.profile == "all":
@@ -581,9 +641,7 @@ def main() -> None:
             _apply_selected_configuration(jobs, selected_configuration)
             manifest["selected_configuration"] = selected_configuration
             manifest["selected_config_path"] = str(selected_path)
-            (output_root / "suite_manifest.json").write_text(
-                json.dumps(manifest, indent=2), encoding="utf-8"
-            )
+            write_json_atomic(output_root / "suite_manifest.json", manifest)
 
     print(f"\nSuite manifest: {output_root / 'suite_manifest.json'}", flush=True)
 

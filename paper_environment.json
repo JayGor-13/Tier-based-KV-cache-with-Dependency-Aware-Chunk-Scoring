@@ -5,7 +5,7 @@
   "torch_policy": "runtime CUDA build; exact version captured in result metadata",
   "cuda_required": true,
   "attention_implementation": "eager",
-  "dtype": "float16",
+  "dtype": "bfloat16",
   "deterministic_algorithms": true,
   "max_vram_fraction": 0.9
 }

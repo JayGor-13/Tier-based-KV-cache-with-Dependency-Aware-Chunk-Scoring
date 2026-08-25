@@ -100,3 +100,59 @@ def test_algorithm_parameter_summary_separates_changed_alpha():
 
     assert len(rows) == 2
     assert {row["alpha"] for row in rows} == {0.6, 0.75}
+
+
+def test_algorithm_parameter_summary_separates_protocol_profiles():
+    first = _run("a", kept_tokens=50)
+    second = _run("b", kept_tokens=50)
+    first["config"]["experiment_variant"] = "main"
+    second["config"]["experiment_variant"] = "parameter_sweep"
+
+    rows = aggregate_algorithm_parameter_rows([first, second])
+
+    assert len(rows) == 2
+    assert {row["experiment_variant"] for row in rows} == {
+        "main",
+        "parameter_sweep",
+    }
+
+
+def test_algorithm_parameter_summary_rejects_conflicting_duplicate_keys():
+    first = _run("a", kept_tokens=50)
+    second = _run("a", kept_tokens=48)
+
+    try:
+        aggregate_algorithm_parameter_rows([first, second])
+    except ValueError as exc:
+        assert "Conflicting duplicate" in str(exc)
+    else:  # pragma: no cover - explicit failure message
+        raise AssertionError("conflicting duplicate was not rejected")
+
+
+def test_algorithm_parameter_summary_reports_nqr_against_fullkv():
+    dense = _run("a", kept_tokens=100)
+    dense["method"] = "fullkv"
+    dense["config"]["budget_specifications"] = []
+    compressed = _run("b", kept_tokens=50)
+
+    rows = aggregate_algorithm_parameter_rows([dense, compressed])
+
+    dense_row = next(row for row in rows if row["method"] == "fullkv")
+    compressed_row = next(row for row in rows if row["method"] == "tdc_kv")
+    assert dense_row["normalized_quality_ratio"] == 100.0
+    assert compressed_row["normalized_quality_ratio"] == 100.0
+    assert compressed_row["quality_wilson_95ci_low"] is not None
+
+
+def test_algorithm_parameter_summary_propagates_fidelity_label():
+    run = _run("a", kept_tokens=50)
+    run["_method_metadata"] = {
+        "implementation": "local_tdc",
+        "reference_equivalence": "native",
+        "paper_claim_level": "proposed_method",
+    }
+
+    row = aggregate_algorithm_parameter_rows([run])[0]
+
+    assert row["reference_equivalence"] == "native"
+    assert row["paper_claim_level"] == "proposed_method"

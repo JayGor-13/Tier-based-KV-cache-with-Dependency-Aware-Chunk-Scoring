@@ -75,16 +75,16 @@ on a laptop GPU.
 The default `main` profile asks for these KV retention ratios:
 
 ```text
-0.75, 0.5, 0.25, 0.125
+0.5, 0.3, 0.2, 0.1
 ```
 
 They correspond to:
 
 ```text
-0.75  -> keep 75% KV, compress 25%
-0.5   -> keep 50% KV, compress 50%
-0.25  -> keep 25% KV, compress 75%
-0.125 -> keep 12.5% KV, compress 87.5%
+0.5 -> keep 50% KV, compress 50%
+0.3 -> keep 30% KV, compress 70%
+0.2 -> keep 20% KV, compress 80%
+0.1 -> keep 10% KV, compress 90%
 ```
 
 ### TDC-KV Algorithm Parameters
@@ -189,7 +189,7 @@ Inside `run_hf_grid.py`, the runner does the actual experiment:
 11. Evicts KV-cache tokens until the target budget is reached.
 12. Generates an answer using the compressed cache.
 13. Scores the answer and cache behavior.
-14. Appends one run row to the checkpoint/result JSON.
+14. Appends one run row transactionally to the SQLite checkpoint.
 
 ## TDC-KV Compression Step
 
@@ -259,7 +259,7 @@ Examples:
 
 ```text
 main_qwen_qwen2_5_1_5b_instruct_gsm8k_shard_1_of_5.json
-main_qwen_qwen2_5_1_5b_instruct_gsm8k_shard_1_of_5.checkpoint.json
+main_qwen_qwen2_5_1_5b_instruct_gsm8k_shard_1_of_5.checkpoint.sqlite
 suite_manifest.json
 ```
 
@@ -532,7 +532,8 @@ python scripts/run_local_paper_suite.py \
 Purpose:
 
 ```text
-Primary quality-vs-compression table for the paper.
+Small-model development/pilot quality-vs-compression table. It is not a
+substitute for the frozen 7B/8B full-test headline profile.
 ```
 
 ### Parameter Sweep
@@ -548,8 +549,8 @@ python scripts/run_local_paper_suite.py \
 Purpose:
 
 ```text
-Shows how theta, alpha, recent window, and compression ratio affect quality and
-KV-cache savings.
+Uses training data to show how theta, alpha, recent window, and compression
+ratio affect quality and KV-cache savings.
 ```
 
 ### Baselines
@@ -565,7 +566,8 @@ python scripts/run_local_paper_suite.py \
 Purpose:
 
 ```text
-Compares TDC-KV against fullkv, StreamingLLM, H2O, SnapKV, and ChunkKV.
+Compares TDC-KV against FullKV and the bundled StreamingLLM, H2O, SnapKV, and
+ChunkKV approximations. These local ports are not official-paper reproductions.
 ```
 
 ## Resume Behavior
@@ -573,7 +575,7 @@ Compares TDC-KV against fullkv, StreamingLLM, H2O, SnapKV, and ChunkKV.
 Every job has:
 
 ```text
-<job>.checkpoint.json
+<job>.checkpoint.sqlite
 <job>.json
 ```
 

@@ -143,3 +143,47 @@ def test_reverse_routing_rescues_historical_bridge_chunk():
     routed = graph.route(torch.tensor([0.0, 0.0, 1.0]))
 
     assert torch.allclose(routed, torch.tensor([0.0, 1.0, 1.0]))
+
+
+def test_all_layer_sparse_graph_matches_dense_mathematical_oracle():
+    torch.manual_seed(23)
+    sequence_length = 6
+    chunk_map = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+    causal_mask = torch.tril(torch.ones(sequence_length, sequence_length)).bool()
+    attentions = []
+    for _layer in range(3):
+        logits = torch.randn(1, 2, sequence_length, sequence_length)
+        logits = logits.masked_fill(~causal_mask, float("-inf"))
+        attentions.append(torch.softmax(logits, dim=-1))
+
+    graph = build_sparse_chunk_dependency_graph(
+        attentions,
+        chunk_map=chunk_map,
+        top_k=2,
+        mode="all",
+        layer_weighting="linear",
+        offload_to_cpu=False,
+    )
+
+    layer_weights = torch.tensor([1.0, 2.0, 3.0]) / 6.0
+    dense_rows = sum(
+        layer_weights[layer] * attentions[layer][0].mean(dim=0)
+        for layer in range(3)
+    )
+    expected_indices = torch.full((3, 2), -1, dtype=torch.long)
+    expected_weights = torch.zeros((3, 2), dtype=torch.float32)
+    for query_chunk in range(3):
+        query_rows = dense_rows[chunk_map == query_chunk]
+        token_mass = query_rows.sum(dim=0)
+        chunk_mass = torch.zeros(3)
+        chunk_mass.scatter_add_(0, chunk_map, token_mass)
+        chunk_mass /= float(query_rows.shape[0])
+        chunk_mass[query_chunk] = 0.0
+        edge_count = min(2, int((chunk_mass > 0).sum().item()))
+        if edge_count:
+            values, indices = torch.topk(chunk_mass, edge_count)
+            expected_indices[query_chunk, :edge_count] = indices
+            expected_weights[query_chunk, :edge_count] = values / values.sum()
+
+    assert torch.equal(graph.neighbor_indices, expected_indices)
+    assert torch.allclose(graph.edge_weights, expected_weights, atol=1e-6, rtol=1e-6)

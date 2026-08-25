@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 import torch
 
+from src.core.numerical import require_finite_scalar, require_finite_tensor
 from src.models.hf_cache_adapter import build_dynamic_cache, cache_layer_tensors
 
 Chunk = Sequence[int] | torch.Tensor
@@ -67,6 +68,9 @@ class DecodingCacheManager:
         }
         if len(lengths) != 1:
             raise ValueError("All cache metadata tensors must have equal length.")
+        require_finite_tensor(
+            "decode_token_scores", self.token_scores, stage="cache_manager_init"
+        )
 
     @classmethod
     def from_prompt(
@@ -120,6 +124,9 @@ class DecodingCacheManager:
             if chunk_scores is None:
                 chunk_score_values = torch.zeros(len(chunks), dtype=torch.float32)
             else:
+                require_finite_tensor(
+                    "chunk_scores", chunk_scores, stage="cache_manager_from_prompt"
+                )
                 chunk_score_values = chunk_scores.detach().to(
                     dtype=torch.float32, device="cpu"
                 )
@@ -164,6 +171,7 @@ class DecodingCacheManager:
         logical_position: int,
         score: float = 0.0,
     ) -> None:
+        require_finite_scalar("generated_token_score", score, stage="cache_manager_append")
         if self.logical_positions.numel() > 0:
             latest = int(self.logical_positions.max().item())
             if logical_position <= latest:
@@ -192,6 +200,8 @@ class DecodingCacheManager:
     ) -> tuple[torch.Tensor, torch.Tensor, CacheTrimEvent]:
         if k_cache.shape != v_cache.shape:
             raise ValueError("k_cache and v_cache must have matching shapes.")
+        require_finite_tensor("decode_k_cache", k_cache, stage="cache_manager_trim")
+        require_finite_tensor("decode_v_cache", v_cache, stage="cache_manager_trim")
         self._validate_physical_length(int(k_cache.shape[-2]))
         kept_positions, event = self._plan_trim(current_logical_length)
         index = kept_positions.to(device=k_cache.device)

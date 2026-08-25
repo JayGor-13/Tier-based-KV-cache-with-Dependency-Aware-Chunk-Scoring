@@ -1,7 +1,6 @@
 """Run TDC-KV over multiple HuggingFace models, datasets, and parameters."""
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -11,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.hf_runner import parse_dataset_spec, run_hf_grid
+from benchmarks.io_utils import write_json_atomic
 from benchmarks.qualification import qualification_report
 
 def parse_args():
@@ -121,6 +121,11 @@ def parse_args():
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
     parser.add_argument("--dtype", type=str, default="auto", help="Torch dtype")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--orchestration-job-id",
+        default=None,
+        help="Immutable suite job request hash used for safe skip/resume checks",
+    )
     parser.add_argument(
         "--decode-policy",
         choices=("common_streaming", "tdc_native"),
@@ -314,6 +319,7 @@ def main():
         preflight_require_cuda=args.require_cuda,
         max_vram_fraction=args.max_vram_fraction,
         deterministic=args.deterministic,
+        orchestration_job_id=args.orchestration_job_id,
         checkpoint_path=checkpoint_path,
         resume=args.resume,
     )
@@ -333,6 +339,12 @@ def main():
         )
     )
     if strict_qualification_requested:
+        declared = results["summary"].get("qualification", {})
+        compressed_methods = [
+            method
+            for method in results.get("grid", {}).get("methods", [])
+            if method != "fullkv"
+        ]
         results["summary"]["qualification"] = qualification_report(
             results,
             require_parity=args.require_qualified,
@@ -344,8 +356,11 @@ def main():
             require_preflight=args.require_model_preflight,
             require_exact_niah=args.require_exact_niah,
             require_no_truncation=args.require_no_truncation,
+            require_fullkv_pairing=bool(compressed_methods),
+            expected_parity_records=declared.get("expected_parity_records"),
+            min_gsm8k_parse_rate=declared.get("min_gsm8k_parse_rate", 0.0),
         )
-    output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    write_json_atomic(output_path, results)
     print(f"Results saved to {output_path}", flush=True)
     if args.require_fullkv_parity:
         parity = results["summary"]["fullkv_parity"]

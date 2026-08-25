@@ -93,7 +93,7 @@ two 1-2B instruction models, GSM8K, HotPotQA, and NIAH:
   `HuggingFaceTB/SmolLM2-1.7B-Instruct`;
 - default datasets: GSM8K test, HotPotQA distractor validation, and NIAH at
   10%, 50%, and 90% needle depths with a 3072-token local context;
-- default compression sweep: 75%, 50%, 25%, and 12.5% KV retention;
+- default compression sweep: 50%, 30%, 20%, and 10% KV retention;
 - default algorithm parameters: `theta=0.3`, `recent_window=16`, `alpha=0.6`,
   `dependency_top_k=8`, semantic chunks up to 64 tokens;
 - outputs: raw resumable JSON files plus CSV/JSON/Markdown summaries grouped by
@@ -134,11 +134,14 @@ under `outputs/local_paper/artifacts/`:
 - `algorithm_parameter_grid.md`: quick Markdown table for inspection;
 - `artifact_manifest.json`: input paths and SHA-256 hashes.
 
-To rebuild summaries after a manual or interrupted run:
+The suite automatically passes its explicit completed output paths to the
+summarizer. For a manual diagnostic rebuild, list files explicitly; wildcard
+discovery requires the deliberately non-paper `--allow-glob` override:
 
 ```bash
 python scripts/summarize_local_paper_results.py \
   --inputs "outputs/local_paper/*.json" \
+  --allow-glob \
   --output-dir outputs/local_paper/artifacts
 ```
 
@@ -180,8 +183,10 @@ The paper path now enforces the following contracts:
   ChunkKV uses direct attention scores independently of TDC-KV dependency
   routing;
 - `common_streaming` applies one decode-cache policy to all compressed methods;
-- every successful row has a deterministic run key, and an atomic checkpoint is
-  updated after every completed row;
+- every successful row has hierarchical deterministic identities, and a
+  transactional SQLite checkpoint is updated after every completed row;
+- non-finite logits, attentions, scores, K/V tensors, runtime values, and final
+  JSON scalars are rejected rather than repaired or serialized as `NaN`;
 - frozen record-level dataset manifests keep qualification, tuning, and final
   partitions disjoint and hash-verified;
 - tokenizer-exact NIAH construction records actual context length/depth, while
@@ -204,10 +209,10 @@ python scripts/run_hf_grid.py \
   --max-length 1024 \
   --max-new-tokens 64 \
   --prefill-block-size 32 \
-  --dtype float16 \
+  --dtype bfloat16 \
   --decode-policy common_streaming \
-  --prompt-serialization chat \
-  --checkpoint outputs/phase1_local.checkpoint.json \
+  --prompt-serialization raw \
+  --checkpoint outputs/phase1_local.checkpoint.sqlite \
   --output outputs/phase1_local.json
 ```
 
@@ -215,7 +220,7 @@ Resume the exact grid after interruption by adding `--resume` with the same
 arguments. A changed model, dataset, seed, protocol, or grid is rejected rather
 than mixed into an existing checkpoint.
 
-The current loader uses ordinary FP16/BF16 weights and eager attention because
+The paper loader uses unquantized BF16 weights and eager attention because
 attention tensors are required for scoring. A 7B/8B model therefore does not
 fit the 6 GB laptop GPU. Run those paper experiments on a Colab Pro session only
 after confirming an A100-class runtime (preferably 40 GB or more); Colab Pro
@@ -241,7 +246,7 @@ $env:HF_TOKEN="hf_your_read_token"
 Resolve and save immutable commits before downloading model weights:
 
 ```bash
-python scripts/preflight_hf_models.py --models "Qwen/Qwen2.5-0.5B-Instruct,meta-llama/Meta-Llama-3-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,Qwen/Qwen2.5-7B-Instruct" --output protocol/model_revisions.json
+python scripts/preflight_hf_models.py --models "Qwen/Qwen2.5-0.5B-Instruct,meta-llama/Meta-Llama-3-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,Qwen/Qwen2-7B-Instruct" --output protocol/model_revisions.json
 ```
 
 Freeze the dataset protocol once. This command only writes the manifest and
@@ -256,10 +261,10 @@ Review and commit `protocol/model_revisions.json` and
 run a one-sample, all-method laptop qualification on the RTX 4050:
 
 ```bash
-python scripts/run_paper_suite.py --profile qualification --methods tdc_kv --max-samples 1 --model-revisions-file protocol/model_revisions.json
+python scripts/run_paper_suite.py --profile qualification --models Qwen/Qwen2.5-0.5B-Instruct --methods fullkv,tdc_kv --max-samples 1 --model-revisions-file protocol/model_revisions.json
 ```
 
-The 7B/8B eager-FP16 correctness path does not fit a 6 GB RTX 4050. Use an
+The 7B/8B eager-BF16 correctness path does not fit a 6 GB RTX 4050. Use an
 A100-class Colab Pro runtime for tuning/final experiments, verify the GPU shown
 by `nvidia-smi`, and run the resumable sharded suite:
 
@@ -267,18 +272,29 @@ by `nvidia-smi`, and run the resumable sharded suite:
 python scripts/run_paper_suite.py --profile all --methods tdc_kv --model-revisions-file protocol/model_revisions.json --sample-shards 10 --resume
 ```
 
-The `all` profile runs qualification, tuning, one deterministic final quality
-pass, three independent timing repetitions, and ablations. Tuning writes
+The `all` profile runs qualification, tuning, a 200-example multi-dataset pilot,
+three independent timing repetitions, and ablations. It does not run the
+official full GSM8K test. Tuning writes
 `selected_config.json` and applies it to all subsequent jobs. Expensive jobs are
-split by model, dataset, and sample shard, with isolated atomic checkpoints.
+split by model, dataset, and sample shard, with isolated transactional SQLite
+checkpoints.
 Use `--dry-run` to inspect generated commands and `--resume` after interruption.
+
+For the official 1,319-example GSM8K comparison, freeze its separate manifest
+and run the dedicated profile after the pilot passes:
+
+```bash
+python scripts/run_paper_suite.py --profile gsm8k_full --protocol-manifest protocol/gsm8k_full_manifest.json --freeze-manifest
+python scripts/run_paper_suite.py --profile gsm8k_full --protocol-manifest protocol/gsm8k_full_manifest.json --model-revisions-file protocol/model_revisions.json --selected-config outputs/paper/selected_config.json --sample-shards 20 --output-root outputs/gsm8k_full --resume
+```
 
 Once the result jobs finish, produce headline CSV/Markdown tables,
 significance tests, and figures with:
 
 ```bash
 python scripts/generate_paper_artifacts.py \
-  --inputs "outputs/paper/main_*.json" \
+  --suite-manifest outputs/paper/suite_manifest.json \
+  --job-prefix main \
   --output-dir outputs/paper/artifacts/main
 ```
 

@@ -27,6 +27,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from benchmarks.experiment_identity import identity_sha256
+from benchmarks.io_utils import write_json_atomic
+from benchmarks.qualification import recompute_declared_qualification
+from benchmarks.result_schema import assert_result_payload
+
 
 DEFAULT_LOCAL_MODELS = (
     "Qwen/Qwen2.5-1.5B-Instruct,"
@@ -34,8 +39,8 @@ DEFAULT_LOCAL_MODELS = (
 )
 DEFAULT_METHODS = "fullkv,tdc_kv"
 BASELINE_METHODS = "fullkv,streamingllm,h2o,snapkv,chunkkv,tdc_kv"
-DEFAULT_BUDGET_RATIOS = "0.75,0.5,0.25,0.125"
-DEFAULT_PARAM_BUDGET_RATIOS = "0.5,0.25,0.125"
+DEFAULT_BUDGET_RATIOS = "0.5,0.3,0.2,0.1"
+DEFAULT_PARAM_BUDGET_RATIOS = "0.3,0.1"
 DEFAULT_THETAS = "0.3"
 DEFAULT_PARAM_THETAS = "0.2,0.3,0.4"
 DEFAULT_RECENT_WINDOWS = "16"
@@ -63,16 +68,31 @@ def _main_datasets(niah_context_length: int) -> str:
     )
 
 
+def _tuning_datasets(niah_context_length: int) -> str:
+    return ";".join(
+        (
+            "name=gsm8k_tuning,source=openai/gsm8k,config=main,split=train,"
+            "adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,"
+            "prompt_field=question,answer_field=answer",
+            "name=hotpotqa_tuning,source=hotpotqa/hotpot_qa,config=distractor,"
+            "split=train,adapter=hotpotqa,prompt_field=question,"
+            "answer_field=answer,id_field=id",
+            f"name=niah_tuning_{niah_context_length}_d50,source=niah,adapter=niah,"
+            f"context_length={niah_context_length},needle_depth=0.5,seed=71",
+        )
+    )
+
+
 def _smoke_datasets() -> str:
     return ";".join(
         (
-            "name=gsm8k,source=openai/gsm8k,config=main,split=test,"
+            "name=gsm8k_qualification,source=openai/gsm8k,config=main,split=train,"
             "adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,"
             "prompt_field=question,answer_field=answer",
-            "name=hotpotqa,source=hotpotqa/hotpot_qa,config=distractor,"
-            "split=validation,adapter=hotpotqa,prompt_field=question,"
+            "name=hotpotqa_qualification,source=hotpotqa/hotpot_qa,config=distractor,"
+            "split=train,adapter=hotpotqa,prompt_field=question,"
             "answer_field=answer,id_field=id",
-            "name=niah_1024_d50,source=niah,adapter=niah,"
+            "name=niah_qualification_1024_d50,source=niah,adapter=niah,"
             "context_length=1024,needle_depth=0.5,seed=29",
         )
     )
@@ -147,12 +167,12 @@ def _base_args(
         "max-length": max_length,
         "max-new-tokens": max_new_tokens,
         "device": "cuda",
-        "dtype": "float16",
-        "attention-mode": "last",
+        "dtype": "bfloat16",
+        "attention-mode": "all",
         "layer-weighting": "linear",
         "tier1-score-mode": "dependency",
         "decode-policy": "common_streaming",
-        "prompt-serialization": "auto",
+        "prompt-serialization": "raw",
         "truncation-side": "right",
         "allow-level2-fallback": True,
         "attn-implementation": "eager",
@@ -170,7 +190,7 @@ def build_local_jobs(
     methods: str | None = None,
     max_samples: int | None = None,
     max_length: int = 3584,
-    max_new_tokens: int = 96,
+    max_new_tokens: int = 256,
     prefill_block_size: int = 16,
     niah_context_length: int = 3072,
     budget_ratios: str | None = None,
@@ -182,6 +202,7 @@ def build_local_jobs(
     use_frozen_manifest: bool = False,
 ) -> list[tuple[str, dict[str, Any]]]:
     selected_datasets = datasets or _main_datasets(niah_context_length)
+    selected_tuning_datasets = _tuning_datasets(niah_context_length)
     if use_frozen_manifest:
         if not protocol_manifest:
             raise ValueError("--use-frozen-manifest requires --protocol-manifest.")
@@ -189,6 +210,11 @@ def build_local_jobs(
             selected_datasets,
             manifest=protocol_manifest,
             partition=manifest_partition,
+        )
+        selected_tuning_datasets = _attach_frozen_partition(
+            selected_tuning_datasets,
+            manifest=protocol_manifest,
+            partition="tuning",
         )
 
     jobs: list[tuple[str, dict[str, Any]]] = []
@@ -218,6 +244,13 @@ def build_local_jobs(
                 ),
             )
         )
+        jobs[-1][1].update(
+            {
+                "fullkv-parity": True,
+                "parity-max-samples": max_samples or 1,
+                "experiment-variant": "qualification",
+            }
+        )
 
     if profile in {"main", "all"}:
         jobs.append(
@@ -242,8 +275,8 @@ def build_local_jobs(
     if profile in {"param_sweep", "all"}:
         args = _base_args(
             models=models,
-            datasets=selected_datasets,
-            methods=methods or "tdc_kv",
+            datasets=selected_tuning_datasets,
+            methods=methods or "fullkv,tdc_kv",
             samples=max_samples or 20,
             budget_ratios=budget_ratios or DEFAULT_PARAM_BUDGET_RATIOS,
             thetas=thetas or DEFAULT_PARAM_THETAS,
@@ -365,7 +398,7 @@ def main() -> None:
     parser.add_argument("--methods", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-length", type=int, default=3584)
-    parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--prefill-block-size", type=int, default=16)
     parser.add_argument("--niah-context-length", type=int, default=3072)
     parser.add_argument("--budget-ratios", default=None)
@@ -408,7 +441,12 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     if args.freeze_manifest:
-        datasets = args.datasets or _main_datasets(args.niah_context_length)
+        datasets = ";".join(
+            (
+                _tuning_datasets(args.niah_context_length),
+                args.datasets or _main_datasets(args.niah_context_length),
+            )
+        )
         command = [
             args.python,
             str(ROOT / "scripts" / "freeze_dataset_manifests.py"),
@@ -495,12 +533,28 @@ def main() -> None:
         "jobs": [],
     }
     for job_name, arguments in jobs:
+        job_request_id = identity_sha256(arguments)
+        arguments["orchestration-job-id"] = job_request_id
         output = output_root / f"{job_name}.json"
-        checkpoint = output_root / f"{job_name}.checkpoint.json"
+        checkpoint = output_root / f"{job_name}.checkpoint.sqlite"
+        legacy_checkpoint = output_root / f"{job_name}.checkpoint.json"
+        if args.resume and not checkpoint.exists() and legacy_checkpoint.exists():
+            checkpoint = legacy_checkpoint
         if args.resume and output.exists():
             existing = json.loads(output.read_text(encoding="utf-8"))
-            failed_runs = int(existing.get("summary", {}).get("failed_runs", 1) or 0)
-            if failed_runs == 0:
+            complete = False
+            try:
+                assert_result_payload(existing, require_complete=True)
+                recomputed = recompute_declared_qualification(existing)
+                complete = (
+                    existing.get("orchestration_job_id") == job_request_id
+                    and int(existing.get("summary", {}).get("failed_runs", 1) or 0)
+                    == 0
+                    and recomputed.get("passed") is True
+                )
+            except (TypeError, ValueError):
+                complete = False
+            if complete:
                 manifest["jobs"].append(
                     {
                         "name": job_name,
@@ -527,32 +581,31 @@ def main() -> None:
             "status": "planned" if args.dry_run else "running",
         }
         manifest["jobs"].append(job_record)
-        (output_root / "suite_manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+        write_json_atomic(output_root / "suite_manifest.json", manifest)
         if args.dry_run:
             continue
         completed = subprocess.run(command, cwd=ROOT, check=False)
         job_record["return_code"] = int(completed.returncode)
         job_record["status"] = "complete" if completed.returncode == 0 else "failed"
-        (output_root / "suite_manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+        write_json_atomic(output_root / "suite_manifest.json", manifest)
         if completed.returncode != 0:
             raise SystemExit(completed.returncode)
 
-    (output_root / "suite_manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
+    write_json_atomic(output_root / "suite_manifest.json", manifest)
     print(f"\nSuite manifest: {output_root / 'suite_manifest.json'}", flush=True)
 
     if args.summarize and not args.dry_run:
         summary_dir = Path(args.summary_output_dir).resolve() if args.summary_output_dir else output_root / "artifacts"
+        result_inputs = [
+            str(job["output"])
+            for job in manifest["jobs"]
+            if job.get("status") in {"complete", "skipped_complete"}
+        ]
         summary_command = [
             args.python,
             str(ROOT / "scripts" / "summarize_local_paper_results.py"),
             "--inputs",
-            str(output_root / "*.json"),
+            *result_inputs,
             "--output-dir",
             str(summary_dir),
         ]

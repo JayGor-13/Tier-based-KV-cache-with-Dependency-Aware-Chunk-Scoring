@@ -23,6 +23,7 @@ import torch
 from torch import Tensor
 
 from src.core.dependency_graph import SparseChunkDependencyGraph
+from src.core.numerical import require_finite_tensor
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,7 @@ class DualSignalScorer:
         # ISSUE: A_obs arrives as float16/bfloat16 from the model's attention
         # computation. Keeping it in float16 during the sum operations risks
         # silent overflow for long sequences (t > 4096). Always upcast here.
+        require_finite_tensor("attention_observation", A_obs, stage="scorer_input")
         A = A_obs.to(device=self.device, dtype=torch.float32)
 
         # Dispatch based on tensor dimensionality
@@ -179,6 +181,10 @@ class DualSignalScorer:
             raise ValueError(
                 f"A_obs must be 3D [H,w,t] or 4D [L,H,w,t], got shape {A_obs.shape}"
             )
+        require_finite_tensor("attention_mass_tokens", M_token, stage="scorer_signals")
+        require_finite_tensor(
+            "dependency_route_tokens", R_token, stage="scorer_signals"
+        )
 
         t = M_token.shape[0]
         M_chunks = len(chunks)
@@ -203,6 +209,8 @@ class DualSignalScorer:
                 )
             direct_relevance = self._minmax_normalize(S1)
             S2 = dependency_graph.to(self.device).route(direct_relevance)
+        require_finite_tensor("attention_chunk_scores_raw", S1, stage="scorer_chunks")
+        require_finite_tensor("dependency_chunk_scores_raw", S2, stage="scorer_chunks")
 
         # Min-max normalize both signals to [0, 1]
         S1_hat = self._minmax_normalize(S1)
@@ -210,6 +218,7 @@ class DualSignalScorer:
 
         # Fuse signals
         Score_chunk = self.alpha * S1_hat + self.beta * S2_hat
+        require_finite_tensor("fused_chunk_scores", Score_chunk, stage="scorer_fusion")
 
         return ScorerResult(
             attention_scores=S1_hat,
@@ -421,15 +430,22 @@ class DualSignalScorer:
         produces 0/0. Returning 0.5 uniform is the safest neutral default —
         Signal 2 still provides differentiation in this case.
         """
+        require_finite_tensor("normalization_input", x, stage="scorer_normalize")
         x_min = x.min()
         x_max = x.max()
         denom = x_max - x_min
 
         if denom.item() < 1e-8:
             # All scores effectively identical — return uniform mid-point
-            return torch.full_like(x, 0.5)
+            result = torch.full_like(x, 0.5)
+            require_finite_tensor(
+                "normalization_output", result, stage="scorer_normalize"
+            )
+            return result
 
-        return (x - x_min) / denom
+        result = (x - x_min) / denom
+        require_finite_tensor("normalization_output", result, stage="scorer_normalize")
+        return result
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -523,6 +539,12 @@ class DualSignalScorer:
             raise ValueError("prev_Score_chunk must be a 1D tensor of shape [M].")
 
         # Recompute full signal vectors with new A_obs
+        require_finite_tensor(
+            "updated_attention_observation", A_obs_new, stage="scorer_update_input"
+        )
+        require_finite_tensor(
+            "previous_chunk_scores", prev_Score_chunk, stage="scorer_update_input"
+        )
         A = A_obs_new.to(device=self.device, dtype=torch.float32)
         if A.dim() == 3:
             M_token, R_token = self._compute_signals_single_layer(A)
@@ -551,6 +573,9 @@ class DualSignalScorer:
             if 0 <= k < M_chunks:
                 Score_chunk[k] = self.alpha * S1_hat[k] + self.beta * S2_hat[k]
 
+        require_finite_tensor(
+            "updated_chunk_scores", Score_chunk, stage="scorer_update_output"
+        )
         return Score_chunk
 
 

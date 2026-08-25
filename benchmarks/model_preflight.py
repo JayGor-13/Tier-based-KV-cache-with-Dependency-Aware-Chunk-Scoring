@@ -94,6 +94,9 @@ def loaded_model_preflight(
     prefill_block_size: int,
     require_cuda: bool,
     max_vram_fraction: float = 0.90,
+    requested_dtype: str | None = None,
+    requested_attention_backend: str | None = None,
+    require_unquantized: bool = False,
 ) -> dict[str, Any]:
     """Validate cache shape assumptions and estimate full-prefill GPU memory."""
     config = model.config
@@ -122,10 +125,21 @@ def loaded_model_preflight(
             "the current pipeline requires a full prompt cache"
         )
 
+    parameters = list(model.parameters())
+    if not parameters:
+        raise ValueError("loaded model has no parameters")
     parameter_bytes = int(
-        sum(parameter.numel() * parameter.element_size() for parameter in model.parameters())
+        sum(parameter.numel() * parameter.element_size() for parameter in parameters)
     )
-    element_size = next(model.parameters()).element_size()
+    element_size = parameters[0].element_size()
+    parameter_dtypes = sorted({str(parameter.dtype) for parameter in parameters})
+    dtype_bytes: dict[str, int] = {}
+    for parameter in parameters:
+        name = str(parameter.dtype)
+        dtype_bytes[name] = dtype_bytes.get(name, 0) + int(
+            parameter.numel() * parameter.element_size()
+        )
+    dominant_parameter_dtype = max(dtype_bytes, key=dtype_bytes.get)
     kv_bytes = int(2 * layers * kv_heads * head_dim * context * element_size)
     attention_bytes = int(
         layers
@@ -147,11 +161,52 @@ def loaded_model_preflight(
         warnings.append("CUDA memory fit was not checked on this device")
 
     attention_backend = getattr(config, "_attn_implementation", None)
-    if attention_backend and str(attention_backend).lower() != "eager":
+    if requested_attention_backend is not None and str(attention_backend) != str(
+        requested_attention_backend
+    ):
+        issues.append(
+            "requested attention backend was not resolved: "
+            f"requested={requested_attention_backend}, actual={attention_backend}"
+        )
+    elif attention_backend and str(attention_backend).lower() != "eager":
         issues.append(
             f"resolved attention backend is `{attention_backend}`; attention output "
             "support requires eager attention for this paper pipeline"
         )
+
+    requested_dtype_name = str(requested_dtype or "").strip().lower()
+    dtype_aliases = {
+        "bf16": "torch.bfloat16",
+        "bfloat16": "torch.bfloat16",
+        "fp16": "torch.float16",
+        "float16": "torch.float16",
+        "fp32": "torch.float32",
+        "float32": "torch.float32",
+    }
+    expected_dtype = dtype_aliases.get(requested_dtype_name)
+    if expected_dtype is not None and dominant_parameter_dtype != expected_dtype:
+        issues.append(
+            "requested dtype was not resolved on model parameters: "
+            f"requested={requested_dtype}, dominant={dominant_parameter_dtype}"
+        )
+
+    quantized_4bit = bool(getattr(model, "is_loaded_in_4bit", False))
+    quantized_8bit = bool(getattr(model, "is_loaded_in_8bit", False))
+    quantization_config = getattr(config, "quantization_config", None)
+    is_quantized = bool(quantized_4bit or quantized_8bit or quantization_config)
+    if require_unquantized and is_quantized:
+        issues.append("headline preflight requires an unquantized model")
+
+    bf16_supported = None
+    gpu_name = None
+    compute_capability = None
+    if device.type == "cuda" and torch.cuda.is_available():
+        bf16_supported = bool(torch.cuda.is_bf16_supported())
+        gpu_name = torch.cuda.get_device_name(device)
+        capability = torch.cuda.get_device_capability(device)
+        compute_capability = [int(capability[0]), int(capability[1])]
+        if expected_dtype == "torch.bfloat16" and not bf16_supported:
+            issues.append("requested BF16 but the CUDA device does not support BF16")
 
     return {
         "passed": not issues,
@@ -161,6 +216,17 @@ def loaded_model_preflight(
         "context_limit": context_limit,
         "sliding_window": sliding_window,
         "attention_backend": attention_backend,
+        "requested_attention_backend": requested_attention_backend,
+        "requested_dtype": requested_dtype,
+        "model_config_torch_dtype": str(getattr(config, "torch_dtype", None)),
+        "parameter_dtypes": parameter_dtypes,
+        "dominant_parameter_dtype": dominant_parameter_dtype,
+        "bf16_supported": bf16_supported,
+        "gpu_name": gpu_name,
+        "compute_capability": compute_capability,
+        "is_quantized": is_quantized,
+        "loaded_in_4bit": quantized_4bit,
+        "loaded_in_8bit": quantized_8bit,
         "parameter_bytes": parameter_bytes,
         "estimated_full_kv_bytes": kv_bytes,
         "estimated_attention_block_bytes": attention_bytes,

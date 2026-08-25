@@ -12,6 +12,8 @@ from typing import Sequence
 
 import torch
 
+from src.core.numerical import require_finite_tensor
+
 Chunk = Sequence[int] | torch.Tensor
 
 
@@ -20,7 +22,7 @@ class MaskerResult:
     """Detailed output for the protection masker."""
 
     tiers: torch.Tensor
-    threshold: float
+    threshold: float | None
     sink_chunk_index: int
     recent_start_chunk_index: int
     tier1_source: str = "chunk_scores"
@@ -97,6 +99,7 @@ def assign_protection_tiers(
             f"Mismatch between chunks ({len(chunks)}) and chunk_scores "
             f"({chunk_scores.numel()})."
         )
+    require_finite_tensor("chunk_scores", chunk_scores, stage="masker_input")
     if recent_window < 0:
         raise ValueError("`recent_window` must be non-negative.")
     if not 0.0 <= float(theta) <= 1.0:
@@ -108,6 +111,9 @@ def assign_protection_tiers(
             raise ValueError(
                 "`protection_scores` length must match `chunk_scores`."
             )
+        require_finite_tensor(
+            "protection_scores", protection_scores, stage="masker_input"
+        )
 
     if sequence_length is None:
         sequence_length = infer_sequence_length(chunks)
@@ -129,16 +135,13 @@ def assign_protection_tiers(
         if recent_start_chunk_index >= 0:
             tiers[recent_start_chunk_index:] = 2
 
-    threshold = float("inf")
+    threshold: float | None = None
     if chunk_scores.numel() > 0 and theta > 0:
         tier1_scores = (
             protection_scores if protection_scores is not None else chunk_scores
         )
-        clean_scores = torch.nan_to_num(
-            tier1_scores.to(device=chunk_scores.device, dtype=torch.float32),
-            nan=-1e9,
-            neginf=-1e9,
-            posinf=1e9,
+        clean_scores = tier1_scores.to(
+            device=chunk_scores.device, dtype=torch.float32
         )
         eligible = torch.nonzero(tiers != 2, as_tuple=False).flatten()
         protect_count = min(

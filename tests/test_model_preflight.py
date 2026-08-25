@@ -7,9 +7,9 @@ from benchmarks.model_preflight import hub_model_preflight, loaded_model_preflig
 
 
 class TinyModel(torch.nn.Module):
-    def __init__(self, *, sliding_window=None):
+    def __init__(self, *, sliding_window=None, dtype=torch.float32, backend="eager"):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(4, 4))
+        self.weight = torch.nn.Parameter(torch.zeros(4, 4, dtype=dtype))
         self.config = SimpleNamespace(
             max_position_embeddings=4096,
             sliding_window=sliding_window,
@@ -17,7 +17,7 @@ class TinyModel(torch.nn.Module):
             num_attention_heads=2,
             num_key_value_heads=1,
             hidden_size=8,
-            _attn_implementation="eager",
+            _attn_implementation=backend,
         )
 
 
@@ -71,3 +71,38 @@ def test_hub_preflight_resolves_immutable_revision_and_weight_size(monkeypatch):
     assert report["passed"] is True
     assert report["resolved_revision"] == "abc123"
     assert report["repository_weight_bytes"] == 30
+
+
+def test_preflight_records_actual_dtype_and_backend():
+    report = loaded_model_preflight(
+        model=TinyModel(dtype=torch.bfloat16),
+        device=torch.device("cpu"),
+        required_context=128,
+        prefill_block_size=16,
+        require_cuda=False,
+        requested_dtype="bfloat16",
+        requested_attention_backend="eager",
+        require_unquantized=True,
+    )
+
+    assert report["passed"] is True
+    assert report["dominant_parameter_dtype"] == "torch.bfloat16"
+    assert report["parameter_dtypes"] == ["torch.bfloat16"]
+    assert report["attention_backend"] == "eager"
+    assert report["is_quantized"] is False
+
+
+def test_preflight_rejects_requested_dtype_and_backend_mismatch():
+    report = loaded_model_preflight(
+        model=TinyModel(dtype=torch.float16, backend="sdpa"),
+        device=torch.device("cpu"),
+        required_context=128,
+        prefill_block_size=16,
+        require_cuda=False,
+        requested_dtype="bfloat16",
+        requested_attention_backend="eager",
+    )
+
+    assert report["passed"] is False
+    assert any("requested dtype" in issue for issue in report["issues"])
+    assert any("requested attention backend" in issue for issue in report["issues"])

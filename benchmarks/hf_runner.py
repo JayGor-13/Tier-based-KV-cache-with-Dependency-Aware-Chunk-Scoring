@@ -25,6 +25,7 @@ from benchmarks.eval_metrics import (
     summarize_qa,
     validate_budget_contract,
 )
+from benchmarks.experiment_identity import build_run_identity, identity_sha256
 from benchmarks.gsm8k_protocol import (
     CHUNKKV_GSM8K_8SHOT_PROTOCOL,
     DEFAULT_PROTOCOL,
@@ -44,7 +45,15 @@ from benchmarks.model_preflight import (
     hub_model_preflight,
     loaded_model_preflight,
 )
+from benchmarks.io_utils import write_json_atomic
+from benchmarks.numerical_validation import NumericalIntegrityError, generation_health
 from benchmarks.qualification import qualification_report
+from benchmarks.checkpoint_store import SQLiteCheckpointStore, is_sqlite_checkpoint
+from benchmarks.result_schema import (
+    SCHEMA_VERSION,
+    assert_result_payload,
+    validate_run_row,
+)
 from benchmarks.reproducibility import collect_environment_metadata, seed_everything
 from benchmarks.runtime_metrics import combine_measurements, measure_call
 from benchmarks.structural_metrics import (
@@ -82,33 +91,40 @@ SUPPORTED_METHODS = {
 METHOD_METADATA = {
     "fullkv": {
         "implementation": "controlled_unpruned_cache",
+        "reference_equivalence": "controlled_reference",
+        "paper_claim_level": "reference_within_recorded_execution_contract",
         "decode_policy": "controlled_greedy_full_cache",
     },
     "streamingllm": {
         "implementation": "local_sink_plus_recency",
         "reference_equivalence": "approximation",
+        "paper_claim_level": "matched_budget_local_approximation",
         "num_sink_tokens": 4,
     },
     "h2o": {
         "implementation": "local_observed_attention_heavy_hitter",
         "reference_equivalence": "approximation",
+        "paper_claim_level": "matched_budget_local_approximation",
         "sink_tokens": 1,
         "heavy_hitter_ratio": 1.0,
     },
     "snapkv": {
         "implementation": "local_snapkv_style_observation_scoring",
         "reference_equivalence": "approximation",
+        "paper_claim_level": "matched_budget_local_approximation",
         "sink_tokens": 0,
         "kernel_size": 5,
     },
     "chunkkv": {
         "implementation": "local_direct_attention_chunk_selection",
         "reference_equivalence": "approximation",
+        "paper_claim_level": "matched_budget_local_approximation",
         "score_source": "direct_attention_only",
     },
     "tdc_kv": {
         "implementation": "repository_tdc_kv",
         "reference_equivalence": "native",
+        "paper_claim_level": "proposed_method",
         "score_source": "attention_plus_dependency_routing",
     },
 }
@@ -1130,6 +1146,40 @@ def _append_method_quality(
         method_qa_rows.setdefault(method, []).append(row)
 
 
+def _generation_health(
+    tokenizer: Any,
+    token_ids: Iterable[int],
+    *,
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    special_ids: set[int] = set()
+    for attribute in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        value = getattr(tokenizer, attribute, None)
+        if isinstance(value, (list, tuple, set)):
+            special_ids.update(int(item) for item in value if item is not None)
+        elif value is not None:
+            special_ids.add(int(value))
+    return generation_health(
+        token_ids,
+        max_new_tokens=max_new_tokens,
+        special_token_ids=special_ids,
+    )
+
+
+def _successful_numerical_health(
+    *,
+    prefill_blocks: int,
+    generated_tokens: int,
+) -> dict[str, Any]:
+    return {
+        "passed": True,
+        "first_failure_stage": None,
+        "prefill_blocks_checked": int(prefill_blocks),
+        "decode_steps_checked": max(int(generated_tokens) - 1, 0),
+        "nonfinite_tensor_count": 0,
+    }
+
+
 def _error_row(
     *,
     model_name: str,
@@ -1138,7 +1188,7 @@ def _error_row(
     error: Exception,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    row = {
         "status": "error",
         "model": model_name,
         "dataset": dataset_name,
@@ -1147,25 +1197,57 @@ def _error_row(
         "error_type": type(error).__name__,
         "error": str(error),
     }
+    if isinstance(error, NumericalIntegrityError):
+        row["numerical_failure"] = error.to_dict()
+    return row
 
 
-def _run_key(
+def _run_identity(
     *,
     model_name: str,
+    model_revision: str | None,
     dataset_name: str,
     sample_id: str,
+    record_sha256_value: str,
+    raw_prompt_sha256: str,
+    prompt_sha256: str,
+    input_token_sha256: str,
     method: str,
     config: dict[str, Any],
-) -> str:
-    identity = {
-        "model": model_name,
-        "dataset": dataset_name,
-        "sample_id": sample_id,
-        "method": method,
-        "config": config,
-    }
-    return _sha256_text(
-        json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
+    experiment_fingerprint: str,
+    actual_dtype: str | None,
+    actual_attention_backend: str | None,
+    seed: int,
+) -> dict[str, str | int]:
+    return build_run_identity(
+        execution_contract={
+            "experiment_fingerprint": experiment_fingerprint,
+            "model": model_name,
+            "model_revision": model_revision,
+            "dataset": dataset_name,
+            "protocol": config.get("protocol"),
+            "prompt_serialization": config.get("prompt_serialization"),
+            "actual_dtype": actual_dtype,
+            "actual_attention_backend": actual_attention_backend,
+            "max_length": config.get("max_length"),
+            "max_new_tokens": config.get("max_new_tokens"),
+            "prefill_block_size": config.get("prefill_block_size"),
+            "attention_mode": config.get("attention_mode"),
+            "layer_weighting": config.get("layer_weighting"),
+        },
+        sample_input={
+            "dataset": dataset_name,
+            "sample_id": sample_id,
+            "record_sha256": record_sha256_value,
+            "raw_prompt_sha256": raw_prompt_sha256,
+            "prompt_sha256": prompt_sha256,
+            "input_token_sha256": input_token_sha256,
+        },
+        method_config={
+            "method": method,
+            "config": config,
+        },
+        seed=seed,
     )
 
 
@@ -1175,24 +1257,20 @@ def _write_checkpoint(
     fingerprint: str,
     runs: list[dict[str, Any]],
     parity_records: list[dict[str, Any]],
+    state: str = "in_progress",
 ) -> None:
     """Atomically persist raw progress so an interrupted grid can resume."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "fingerprint": fingerprint,
-                "runs": runs,
-                "parity_records": parity_records,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    write_json_atomic(
+        path,
+        {
+            "schema_version": 2,
+            "state": str(state),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "fingerprint": fingerprint,
+            "runs": runs,
+            "parity_records": parity_records,
+        },
     )
-    temporary.replace(path)
 
 
 def run_hf_grid(
@@ -1245,6 +1323,7 @@ def run_hf_grid(
     preflight_require_cuda: bool = False,
     max_vram_fraction: float = 0.90,
     deterministic: bool = True,
+    orchestration_job_id: str | None = None,
     checkpoint_path: str | Path | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
@@ -1386,10 +1465,8 @@ def run_hf_grid(
         "preflight_require_cuda": bool(preflight_require_cuda),
         "max_vram_fraction": float(max_vram_fraction),
         "environment_signature": environment_signature,
+        "orchestration_job_id": orchestration_job_id,
     }
-    experiment_fingerprint = _sha256_text(
-        json.dumps(fingerprint_payload, sort_keys=True, default=str)
-    )
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
 
     unsharded_dataset_records = {
@@ -1414,6 +1491,10 @@ def run_hf_grid(
         ]
         for spec in dataset_specs
     }
+    fingerprint_payload["actual_sample_manifest"] = actual_sample_manifest
+    experiment_fingerprint = _sha256_text(
+        json.dumps(fingerprint_payload, sort_keys=True, default=str)
+    )
 
     runs: list[dict[str, Any]] = []
     metric_rows: list[CacheMetrics] = []
@@ -1426,10 +1507,23 @@ def run_hf_grid(
     baseline_qa_rows: list[dict[str, str]] = []
     evicted_qa_rows: list[dict[str, str]] = []
     parity_records: list[dict[str, Any]] = []
+    checkpoint_store: SQLiteCheckpointStore | None = None
+    if checkpoint is not None and is_sqlite_checkpoint(checkpoint):
+        checkpoint_store = SQLiteCheckpointStore(
+            checkpoint,
+            fingerprint=experiment_fingerprint,
+            resume=resume,
+        )
     if resume:
         if checkpoint is None or not checkpoint.exists():
             raise FileNotFoundError("Resume requires an existing checkpoint file.")
-        saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+        saved = (
+            checkpoint_store.load()
+            if checkpoint_store is not None
+            else json.loads(checkpoint.read_text(encoding="utf-8"))
+        )
+        if checkpoint_store is None and saved.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("Legacy checkpoints are diagnostic-only and cannot be resumed.")
         if saved.get("fingerprint") != experiment_fingerprint:
             raise ValueError(
                 "Checkpoint configuration does not match the requested experiment."
@@ -1438,7 +1532,9 @@ def run_hf_grid(
         # mismatches are retried and replaced instead of poisoning the resumed
         # final result with stale transient failures.
         runs = [
-            row for row in saved.get("runs", []) if row.get("status") == "ok"
+            row
+            for row in saved.get("runs", [])
+            if row.get("status") == "ok" and not validate_run_row(row)
         ]
         parity_records = [
             row
@@ -1457,13 +1553,21 @@ def run_hf_grid(
     }
 
     def append_run(row: dict[str, Any]) -> None:
+        validation_failures = validate_run_row(row)
+        if validation_failures:
+            raise ValueError(
+                "Refusing to record invalid run row: "
+                + "; ".join(validation_failures)
+            )
         key = row.get("run_key")
         if key and key in completed_run_keys:
             return
         runs.append(row)
         if row.get("status") == "ok" and key:
             completed_run_keys.add(str(key))
-        if checkpoint is not None:
+        if checkpoint_store is not None:
+            checkpoint_store.append_run(row)
+        elif checkpoint is not None:
             _write_checkpoint(
                 checkpoint,
                 fingerprint=experiment_fingerprint,
@@ -1472,7 +1576,10 @@ def run_hf_grid(
             )
 
     def save_parity() -> None:
-        if checkpoint is not None:
+        if checkpoint_store is not None:
+            if parity_records:
+                checkpoint_store.upsert_parity(parity_records[-1])
+        elif checkpoint is not None:
             _write_checkpoint(
                 checkpoint,
                 fingerprint=experiment_fingerprint,
@@ -1536,6 +1643,9 @@ def run_hf_grid(
             prefill_block_size=prefill_block_size,
             require_cuda=preflight_require_cuda,
             max_vram_fraction=max_vram_fraction,
+            requested_dtype=dtype,
+            requested_attention_backend=attn_implementation,
+            require_unquantized=require_model_preflight,
         )
         preflight = {
             "passed": runtime_preflight.get("passed") is True
@@ -1579,6 +1689,7 @@ def run_hf_grid(
                     _get_nested(model_record, spec.id_field)
                     or f"{spec.name}_{model_record.get('__tdc_source_index', sample_index)}"
                 )
+                source_record_sha256 = record_sha256(record)
                 report(
                     f"[sample {sample_index + 1}/{len(records)}] "
                     f"dataset={spec.name} id={sample_id}"
@@ -1827,12 +1938,23 @@ def run_hf_grid(
                             ),
                         }
                     )
-                    full_run_key = _run_key(
+                    full_identity = _run_identity(
                         model_name=model_name,
+                        model_revision=model_revision,
                         dataset_name=spec.name,
                         sample_id=sample_id,
+                        record_sha256_value=source_record_sha256,
+                        raw_prompt_sha256=raw_prompt_sha256,
+                        prompt_sha256=prompt_sha256,
+                        input_token_sha256=input_token_sha256,
                         method="fullkv",
                         config=full_config,
+                        experiment_fingerprint=experiment_fingerprint,
+                        actual_dtype=runtime_preflight.get("dominant_parameter_dtype"),
+                        actual_attention_backend=runtime_preflight.get(
+                            "attention_backend"
+                        ),
+                        seed=seed,
                     )
                     append_run(
                         {
@@ -1862,7 +1984,8 @@ def run_hf_grid(
                                 )
                                 if model_record.get(key) is not None
                             },
-                            "run_key": full_run_key,
+                            **full_identity,
+                            "record_sha256": source_record_sha256,
                             "config": full_config,
                             "sequence_length": prefill.sequence_length,
                             "prefill_blocks": prefill.prefill_blocks,
@@ -1885,6 +2008,15 @@ def run_hf_grid(
                             "prediction": prediction,
                             "evicted_prediction": prediction,
                             "generated_token_ids": list(full_generation.token_ids),
+                            "generation_health": _generation_health(
+                                bundle.tokenizer,
+                                full_generation.token_ids,
+                                max_new_tokens=max_new_tokens,
+                            ),
+                            "numerical_health": _successful_numerical_health(
+                                prefill_blocks=prefill.prefill_blocks,
+                                generated_tokens=len(full_generation.token_ids),
+                            ),
                             "gold": gold,
                             "judgment": full_judgment,
                         }
@@ -2061,13 +2193,27 @@ def run_hf_grid(
                                 "experiment_variant": str(experiment_variant),
                                 "method_metadata": METHOD_METADATA[method],
                             }
-                            run_key = _run_key(
+                            run_identity = _run_identity(
                                 model_name=model_name,
+                                model_revision=model_revision,
                                 dataset_name=spec.name,
                                 sample_id=sample_id,
+                                record_sha256_value=source_record_sha256,
+                                raw_prompt_sha256=raw_prompt_sha256,
+                                prompt_sha256=prompt_sha256,
+                                input_token_sha256=input_token_sha256,
                                 method=method,
                                 config=config,
+                                experiment_fingerprint=experiment_fingerprint,
+                                actual_dtype=runtime_preflight.get(
+                                    "dominant_parameter_dtype"
+                                ),
+                                actual_attention_backend=runtime_preflight.get(
+                                    "attention_backend"
+                                ),
+                                seed=seed,
                             )
+                            run_key = str(run_identity["run_key"])
                             if run_key in completed_run_keys:
                                 report(f"  [{method}] Resumed: already complete.")
                                 continue
@@ -2261,7 +2407,8 @@ def run_hf_grid(
                                 append_run(
                                     {
                                         "status": "ok",
-                                        "run_key": run_key,
+                                        **run_identity,
+                                        "record_sha256": source_record_sha256,
                                         "method": method,
                                         "model": model_name,
                                         "dataset": spec.name,
@@ -2375,6 +2522,15 @@ def run_hf_grid(
                                         "prediction": prediction,
                                         "evicted_prediction": evicted_prediction,
                                         "generated_token_ids": generated_token_ids,
+                                        "generation_health": _generation_health(
+                                            bundle.tokenizer,
+                                            generated_token_ids,
+                                            max_new_tokens=max_new_tokens,
+                                        ),
+                                        "numerical_health": _successful_numerical_health(
+                                            prefill_blocks=prefill.prefill_blocks,
+                                            generated_tokens=len(generated_token_ids),
+                                        ),
                                         "gold": gold,
                                         "judgment": judgment,
                                     }
@@ -2436,7 +2592,24 @@ def run_hf_grid(
                 evicted_qa_rows.append(qa_row)
 
     grouped_results = aggregate_grouped_runs(runs)
+    protocol_fingerprint = identity_sha256(
+        {
+            "protocols": {
+                spec.name: protocol_metadata(spec.protocol) for spec in dataset_specs
+            },
+            "dataset_manifest_hashes": dataset_manifest_hashes,
+            "prompt_serialization": prompt_serialization,
+            "truncation_side": truncation_side,
+            "max_length": max_length,
+            "max_new_tokens": max_new_tokens,
+            "decode_policy": decode_policy,
+        }
+    )
+    successful_count = sum(1 for row in runs if row["status"] == "ok")
+    failed_count = sum(1 for row in runs if row["status"] == "error")
     payload = {
+        "schema_version": SCHEMA_VERSION,
+        "state": "complete",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "models": model_names,
         "model_revisions": resolved_model_revisions,
@@ -2445,6 +2618,16 @@ def run_hf_grid(
         "environment": environment_metadata,
         "model_load_runtime": model_load_measurements,
         "experiment_fingerprint": experiment_fingerprint,
+        "orchestration_job_id": orchestration_job_id,
+        "job_fingerprint": experiment_fingerprint,
+        "protocol_fingerprint": protocol_fingerprint,
+        "coverage": {
+            "planned_runs": len(runs),
+            "observed_runs": len(runs),
+            "successful_runs": successful_count,
+            "failed_runs": failed_count,
+            "validated_runs": successful_count,
+        },
         "datasets": [spec.to_dict() for spec in dataset_specs],
         "dataset_manifest_hashes": dataset_manifest_hashes,
         "sample_manifest": actual_sample_manifest,
@@ -2500,8 +2683,8 @@ def run_hf_grid(
         },
         "summary": {
             "total_runs": len(runs),
-            "successful_runs": sum(1 for row in runs if row["status"] == "ok"),
-            "failed_runs": sum(1 for row in runs if row["status"] == "error"),
+            "successful_runs": successful_count,
+            "failed_runs": failed_count,
             "group_count": len(grouped_results),
             "cache_summary": summarize_cache_metrics(metric_rows),
             "baseline_qa_summary": summarize_qa(baseline_qa_rows),
@@ -2525,7 +2708,37 @@ def run_hf_grid(
         payload,
         require_parity=run_fullkv_parity,
         require_cuda=False,
+        require_fullkv_pairing=bool(compressed_methods),
+        expected_parity_records=(
+            sum(
+                min(
+                    len(samples),
+                    int(parity_max_samples)
+                    if parity_max_samples is not None
+                    else len(samples),
+                )
+                for samples in actual_sample_manifest.values()
+            )
+            * len(model_names)
+            if run_fullkv_parity
+            else None
+        ),
+        min_gsm8k_parse_rate=(
+            0.9 if str(experiment_variant) == "qualification" else 0.0
+        ),
     )
+    assert_result_payload(payload, require_complete=True)
+    if checkpoint_store is not None:
+        checkpoint_store.mark_complete()
+        checkpoint_store.close()
+    elif checkpoint is not None:
+        _write_checkpoint(
+            checkpoint,
+            fingerprint=experiment_fingerprint,
+            runs=runs,
+            parity_records=parity_records,
+            state="complete",
+        )
     return payload
 
 

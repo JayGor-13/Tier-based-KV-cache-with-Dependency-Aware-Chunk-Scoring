@@ -7,6 +7,8 @@ from typing import Sequence
 
 import torch
 
+from src.core.numerical import require_finite_tensor
+
 Chunk = Sequence[int] | torch.Tensor
 
 
@@ -146,6 +148,7 @@ def compute_keep_mask(
         raise ValueError("`chunk_scores` must be 1D.")
     if mask_tiers.numel() != chunk_scores.numel() or mask_tiers.numel() != len(chunks):
         raise ValueError("Mismatch among `mask_tiers`, `chunk_scores`, and `chunks`.")
+    require_finite_tensor("chunk_scores", chunk_scores, stage="eviction_ranking")
     if budget < 0:
         raise ValueError("`budget` must be non-negative.")
     if sequence_length < 0:
@@ -228,6 +231,8 @@ def evict_kv_cache(
         )
     if k_cache.ndim < 2:
         raise ValueError("k_cache/v_cache must have at least 2 dimensions.")
+    require_finite_tensor("k_cache_before_eviction", k_cache, stage="eviction_input")
+    require_finite_tensor("v_cache_before_eviction", v_cache, stage="eviction_input")
 
     t_from_cache = int(k_cache.shape[-2])
     if sequence_length is None:
@@ -265,6 +270,8 @@ def evict_kv_cache(
 
     new_k_cache = select_cache_positions(k_cache, kept_indices)
     new_v_cache = select_cache_positions(v_cache, kept_indices)
+    require_finite_tensor("k_cache_after_eviction", new_k_cache, stage="eviction_output")
+    require_finite_tensor("v_cache_after_eviction", new_v_cache, stage="eviction_output")
 
     return EvictionResult(
         new_k_cache=new_k_cache,

@@ -13,10 +13,12 @@ def test_local_main_defaults_target_two_small_models_and_three_task_families():
     assert "name=gsm8k" in arguments["datasets"]
     assert "name=hotpotqa" in arguments["datasets"]
     assert "name=niah_3072_d50" in arguments["datasets"]
-    assert arguments["budget-ratios"] == "0.75,0.5,0.25,0.125"
+    assert arguments["budget-ratios"] == "0.5,0.3,0.2,0.1"
     assert arguments["max-samples"] == 3
     assert arguments["device"] == "cuda"
-    assert arguments["dtype"] == "float16"
+    assert arguments["dtype"] == "bfloat16"
+    assert arguments["attention-mode"] == "all"
+    assert arguments["prompt-serialization"] == "raw"
 
 
 def test_local_param_sweep_exposes_algorithm_parameters():
@@ -24,7 +26,8 @@ def test_local_param_sweep_exposes_algorithm_parameters():
 
     name, arguments = jobs[0]
     assert name == "param_sweep"
-    assert arguments["methods"] == "tdc_kv"
+    assert arguments["methods"] == "fullkv,tdc_kv"
+    assert "split=train" in arguments["datasets"]
     assert arguments["thetas"] == "0.2,0.3,0.4"
     assert arguments["recent-windows"] == "16,32"
     assert arguments["alphas"] == "0.25,0.6,0.75"

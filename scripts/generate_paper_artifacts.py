@@ -21,6 +21,46 @@ from benchmarks.paper_reporting import (
     write_csv,
     write_markdown_tables,
 )
+from benchmarks.io_utils import write_json_atomic
+
+
+def resolve_input_paths(
+    *,
+    inputs: list[str],
+    suite_manifest: str | None,
+    job_prefix: str | None,
+    allow_glob: bool,
+) -> list[str]:
+    paths: list[str] = []
+    for pattern in inputs:
+        if glob.has_magic(pattern) and not allow_glob:
+            raise ValueError(
+                "Wildcard discovery is disabled for paper artifacts; pass the "
+                "suite manifest's explicit output paths."
+            )
+        matches = sorted(glob.glob(pattern))
+        paths.extend(matches or [pattern])
+    if suite_manifest:
+        manifest_path = Path(suite_manifest)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for job in manifest.get("jobs", []):
+            if job.get("status") not in {"complete", "skipped_complete"}:
+                continue
+            if job_prefix and not str(job.get("name", "")).startswith(job_prefix):
+                continue
+            output = Path(str(job.get("output", "")))
+            if not output.is_absolute():
+                output = manifest_path.parent / output
+            paths.append(str(output.resolve()))
+    paths = [
+        path
+        for path in dict.fromkeys(paths)
+        if not path.endswith((".checkpoint.json", ".checkpoint.sqlite"))
+        and not path.endswith("suite_manifest.json")
+    ]
+    if not paths:
+        raise ValueError("No result JSON files were selected.")
+    return paths
 
 
 def main() -> None:
@@ -28,24 +68,33 @@ def main() -> None:
     parser.add_argument(
         "--inputs",
         nargs="+",
-        required=True,
+        default=[],
         help="Result JSON paths or glob patterns",
     )
+    parser.add_argument(
+        "--suite-manifest",
+        help="Select completed outputs from an explicit suite manifest",
+    )
+    parser.add_argument(
+        "--job-prefix",
+        help="With --suite-manifest, include only job names with this prefix",
+    )
     parser.add_argument("--output-dir", default="outputs/paper/artifacts")
+    parser.add_argument(
+        "--allow-glob",
+        action="store_true",
+        help="Diagnostic-only: permit wildcard input discovery",
+    )
     args = parser.parse_args()
 
-    paths: list[str] = []
-    for pattern in args.inputs:
-        matches = sorted(glob.glob(pattern))
-        paths.extend(matches or [pattern])
-    paths = [
-        path
-        for path in dict.fromkeys(paths)
-        if not path.endswith(".checkpoint.json")
-        and not path.endswith("suite_manifest.json")
-    ]
-    if not paths:
-        raise ValueError("No result JSON files matched --inputs.")
+    if not args.inputs and not args.suite_manifest:
+        parser.error("provide --inputs and/or --suite-manifest")
+    paths = resolve_input_paths(
+        inputs=args.inputs,
+        suite_manifest=args.suite_manifest,
+        job_prefix=args.job_prefix,
+        allow_glob=args.allow_glob,
+    )
     missing = [path for path in paths if not Path(path).exists()]
     if missing:
         raise FileNotFoundError(f"Missing result files: {missing}")
@@ -77,26 +126,38 @@ def main() -> None:
     runs = load_paper_runs(paths)
     rows = aggregate_paper_rows(runs)
     paired_rows = paired_significance_rows(runs)
+    approximate_methods = sorted(
+        {
+            str(row["method"])
+            for row in rows
+            if row.get("reference_equivalence") == "approximation"
+        }
+    )
     write_csv(rows, output / "all_results.csv")
     write_csv(paired_rows, output / "paired_significance.csv")
-    (output / "all_results.json").write_text(
-        json.dumps(rows, indent=2), encoding="utf-8"
-    )
-    (output / "artifact_manifest.json").write_text(
-        json.dumps(
-            {
-                "inputs": input_manifest,
-                "aggregate_rows": len(rows),
-                "paired_comparisons": len(paired_rows),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    write_json_atomic(output / "all_results.json", rows)
+    write_json_atomic(
+        output / "artifact_manifest.json",
+        {
+            "inputs": input_manifest,
+            "aggregate_rows": len(rows),
+            "paired_comparisons": len(paired_rows),
+            "approximate_baseline_methods": approximate_methods,
+            "claim_policy": (
+                "Methods listed in approximate_baseline_methods are controlled "
+                "local ports, not official-paper reproductions."
+            ),
+        },
     )
     write_markdown_tables(rows, output)
     generate_figures(rows, output / "figures")
     print(f"Loaded {len(runs)} successful runs from {len(paths)} files.")
     print(f"Generated {len(rows)} aggregate rows in {output}.")
+    if approximate_methods:
+        print(
+            "Approximate baseline implementations (label accordingly): "
+            + ", ".join(approximate_methods)
+        )
 
 
 if __name__ == "__main__":

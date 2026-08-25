@@ -225,6 +225,7 @@ def test_aggregation_cli_writes_grouped_result_file(tmp_path, monkeypatch):
             str(input_path),
             "--output",
             str(output_path),
+            "--allow-unqualified",
         ],
     )
 

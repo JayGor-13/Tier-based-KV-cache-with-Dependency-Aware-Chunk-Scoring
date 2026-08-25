@@ -8,6 +8,7 @@ transformers = pytest.importorskip("transformers")
 from benchmarks import hf_runner
 from benchmarks.gsm8k_protocol import CHUNKKV_GSM8K_8SHOT_PROTOCOL
 from src.core.evictor import evict_kv_cache
+from src.core.numerical import NumericalIntegrityError
 from src.models.cache_utils import (
     EvictedGenerationResult,
     HfModelBundle,
@@ -190,6 +191,27 @@ def test_unpruned_custom_cache_generation_matches_fullkv_token_ids(family):
     assert cache_path.text == fullkv.text
 
 
+def test_native_generation_rejects_nan_logits_before_token_selection():
+    model = _model_for_family("gpt2")
+    tokenizer = _TokenFixture()
+
+    def corrupt_logits(_module, _args, output):
+        output.logits.fill_(float("nan"))
+        return output
+
+    hook = model.register_forward_hook(corrupt_logits)
+    try:
+        with pytest.raises(NumericalIntegrityError, match="native_generation_logits"):
+            generate_text(
+                model=model,
+                tokenizer=tokenizer,
+                prompt="ignored",
+                max_new_tokens=2,
+            )
+    finally:
+        hook.remove()
+
+
 def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypatch):
     dataset_path = tmp_path / "gsm8k.jsonl"
     dataset_path.write_text(
@@ -331,6 +353,8 @@ def test_hf_grid_all_methods_have_fair_scores_runtime_and_resume(tmp_path, monke
     assert tdc["score_source"] == "attention_plus_dependency_routing"
 
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["state"] == "complete"
     saved["runs"].append(
         {
             "status": "error",
@@ -346,6 +370,62 @@ def test_hf_grid_all_methods_have_fair_scores_runtime_and_resume(tmp_path, monke
     assert all(row["status"] == "ok" for row in resumed["runs"])
     assert [row["run_key"] for row in resumed["runs"] if row.get("run_key")] == [
         row["run_key"] for row in payload["runs"] if row.get("run_key")
+    ]
+
+    dataset_path.write_text(
+        '{"id":"sample-1","prompt":"changed content","answer":"1"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        hf_runner.run_hf_grid(**kwargs, resume=True)
+
+
+def test_hf_grid_transactional_sqlite_checkpoint_resumes_exact_rows(
+    tmp_path,
+    monkeypatch,
+):
+    dataset_path = tmp_path / "records.jsonl"
+    dataset_path.write_text(
+        '{"id":"sample-1","prompt":"ignored","answer":"1"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hf_runner,
+        "load_hf_model_and_tokenizer",
+        lambda *_args, **_kwargs: HfModelBundle(
+            model=_model_for_family("qwen2"),
+            tokenizer=_TokenFixture(),
+            device=torch.device("cpu"),
+        ),
+    )
+    kwargs = dict(
+        model_names=["tiny/qwen2"],
+        dataset_specs=[
+            hf_runner.DatasetSpec(
+                name="local",
+                source=str(dataset_path),
+                prompt_field="prompt",
+                answer_field="answer",
+                id_field="id",
+            )
+        ],
+        budgets=[],
+        budget_ratios=[],
+        thetas=[0.3],
+        recent_windows=[2],
+        alphas=[0.6],
+        methods=["fullkv"],
+        max_samples=1,
+        max_new_tokens=1,
+        min_chunk_tokens=1,
+        checkpoint_path=tmp_path / "checkpoint.sqlite",
+    )
+
+    first = hf_runner.run_hf_grid(**kwargs)
+    resumed = hf_runner.run_hf_grid(**kwargs, resume=True)
+
+    assert [row["run_key"] for row in resumed["runs"]] == [
+        row["run_key"] for row in first["runs"]
     ]
 
 
@@ -499,3 +579,30 @@ def test_repeated_decode_eviction_maintains_exact_budget():
     assert result.cache_summary["initial_post_trim_tokens"] == budget
     assert result.cache_summary["max_post_trim_tokens"] == budget
     assert result.cache_summary["final_cache_tokens"] == budget
+
+
+def test_decode_rejects_nan_logits_before_argmax():
+    family = "qwen2"
+    model = _model_for_family(family)
+    prefill = _prefill(family)
+
+    def corrupt_logits(_module, _args, output):
+        output.logits.fill_(float("nan"))
+        return output
+
+    hook = model.register_forward_hook(corrupt_logits)
+    try:
+        with pytest.raises(NumericalIntegrityError, match="decode_logits"):
+            generate_text_with_evicted_cache(
+                model=model,
+                tokenizer=_TokenFixture(),
+                first_new_token_id=prefill.next_token_id,
+                max_new_tokens=2,
+                k_cache=prefill.k_cache,
+                v_cache=prefill.v_cache,
+                original_sequence_length=prefill.sequence_length,
+                budget=None,
+                return_details=True,
+            )
+    finally:
+        hook.remove()

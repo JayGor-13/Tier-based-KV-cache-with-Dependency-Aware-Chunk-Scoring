@@ -7,6 +7,8 @@ from typing import Sequence
 
 import torch
 
+from src.core.numerical import require_finite_tensor
+
 
 @dataclass(frozen=True)
 class SparseChunkDependencyGraph:
@@ -29,6 +31,9 @@ class SparseChunkDependencyGraph:
             raise ValueError("Dependency graph indices must use torch.long dtype.")
         if not torch.is_floating_point(self.edge_weights):
             raise ValueError("Dependency graph weights must be floating point.")
+        require_finite_tensor(
+            "dependency_edge_weights", self.edge_weights, stage="graph_construct"
+        )
         if bool((self.edge_weights < 0).any().item()):
             raise ValueError("Dependency graph weights must be non-negative.")
 
@@ -63,6 +68,9 @@ class SparseChunkDependencyGraph:
                 "chunk_relevance length must match dependency graph chunk count."
             )
 
+        require_finite_tensor(
+            "chunk_relevance", chunk_relevance, stage="graph_route_input"
+        )
         relevance = chunk_relevance.to(dtype=torch.float32)
         indices = self.neighbor_indices.to(device=relevance.device)
         weights = self.edge_weights.to(device=relevance.device, dtype=torch.float32)
@@ -85,6 +93,7 @@ class SparseChunkDependencyGraph:
             indices[valid],
             contributions[valid],
         )
+        require_finite_tensor("routed_relevance", routed, stage="graph_route_output")
         return routed
 
 
@@ -136,6 +145,9 @@ class SparseChunkDependencyGraphBuilder:
         ``attention_rows`` may be ``[queries, keys]`` after head/layer
         aggregation or ``[heads, queries, keys]``. Head rows are averaged.
         """
+        require_finite_tensor(
+            "dependency_attention_rows", attention_rows, stage="graph_update"
+        )
         rows = attention_rows.to(device=self.device, dtype=torch.float32)
         if rows.ndim == 3:
             rows = rows.mean(dim=0)
@@ -265,6 +277,9 @@ def aggregate_attention_rows(
             combined_rows += float(weight) * layer_rows
 
     assert combined_rows is not None
+    require_finite_tensor(
+        "aggregated_dependency_attention", combined_rows, stage="graph_aggregate"
+    )
     return combined_rows
 
 

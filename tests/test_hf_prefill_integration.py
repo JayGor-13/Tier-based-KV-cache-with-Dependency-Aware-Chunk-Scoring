@@ -6,6 +6,7 @@ transformers = pytest.importorskip("transformers")
 from src.core.evictor import evict_kv_cache
 from src.core.dependency_graph import build_sparse_chunk_dependency_graph
 from src.core.masker import assign_protection_tiers
+from src.core.numerical import NumericalIntegrityError
 from src.core.scorer import DualSignalScorer
 from src.models.cache_utils import (
     EvictedGenerationResult,
@@ -180,3 +181,38 @@ def test_hf_prefill_rejects_nonpositive_block_size():
             observation_window=2,
             prefill_block_size=0,
         )
+
+
+def test_prefill_rejects_nan_logits_before_argmax():
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    model = GPT2LMHeadModel(
+        GPT2Config(
+            vocab_size=32,
+            n_positions=32,
+            n_embd=16,
+            n_layer=1,
+            n_head=2,
+            use_cache=True,
+        )
+    ).eval()
+
+    def corrupt_logits(_module, _args, output):
+        output.logits.fill_(float("nan"))
+        return output
+
+    hook = model.register_forward_hook(corrupt_logits)
+    try:
+        with pytest.raises(NumericalIntegrityError, match="prefill_logits"):
+            run_hf_prefill(
+                model=model,
+                tokenizer=_TinyTokenizer(),
+                prompt="ignored",
+                sample_id="nan_prefill",
+                observation_window=2,
+                min_chunk_tokens=1,
+                dependency_top_k=None,
+                prefill_block_size=3,
+            )
+    finally:
+        hook.remove()

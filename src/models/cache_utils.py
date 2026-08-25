@@ -20,6 +20,7 @@ from src.core.dependency_graph import (
     SparseChunkDependencyGraphBuilder,
     aggregate_attention_rows,
 )
+from src.core.numerical import require_finite_tensor, validate_token_ids
 from src.models.cache_manager import DecodingCacheManager
 from src.models.hf_cache_adapter import build_dynamic_cache, cache_layer_tensors
 
@@ -64,6 +65,7 @@ class HfPrefillRecord:
     v_cache: torch.Tensor
     dependency_graph: SparseChunkDependencyGraph | None = None
     next_token_id: int | None = None
+    next_token_logits: torch.Tensor | None = None
     max_chunk_tokens: int | None = None
     prefill_block_size: int | None = None
     prefill_blocks: int = 1
@@ -106,10 +108,10 @@ def resolve_torch_dtype(
 ) -> torch.dtype | None:
     """Resolve a CLI dtype string for model loading."""
     dtype = dtype.lower()
-    device_obj = resolve_device(device)
-
     if dtype == "auto":
-        return torch.float16 if device_obj.type == "cuda" else torch.float32
+        # Preserve the checkpoint-native dtype. CUDA availability alone is not
+        # evidence that FP16 is numerically safe for eager attention.
+        return None
     if dtype in {"none", "default"}:
         return None
     if dtype in {"float16", "fp16"}:
@@ -130,6 +132,7 @@ def load_hf_model_and_tokenizer(
     dtype: str = "auto",
     trust_remote_code: bool = False,
     attn_implementation: str | None = None,
+    allow_attn_fallback: bool = False,
 ) -> HfModelBundle:
     """Load a HuggingFace causal LM and tokenizer lazily.
 
@@ -157,7 +160,9 @@ def load_hf_model_and_tokenizer(
         tokenizer.pad_token = tokenizer.eos_token
 
     model_kwargs: dict[str, Any] = dict(hub_kwargs)
-    if torch_dtype is not None:
+    if str(dtype).strip().lower() == "auto":
+        model_kwargs["dtype"] = "auto"
+    elif torch_dtype is not None:
         model_kwargs["dtype"] = torch_dtype
     if attn_implementation:
         model_kwargs["attn_implementation"] = attn_implementation
@@ -167,7 +172,7 @@ def load_hf_model_and_tokenizer(
         legacy_dtype_kwargs = dict(model_kwargs)
         legacy_dtype_kwargs["torch_dtype"] = legacy_dtype_kwargs.pop("dtype")
         load_attempts.append(legacy_dtype_kwargs)
-    if attn_implementation:
+    if attn_implementation and allow_attn_fallback:
         for candidate in list(load_attempts):
             without_attn = dict(candidate)
             without_attn.pop("attn_implementation", None)
@@ -186,6 +191,13 @@ def load_hf_model_and_tokenizer(
 
     model.to(device_obj)
     model.eval()
+    if attn_implementation and not allow_attn_fallback:
+        actual_attn = getattr(model.config, "_attn_implementation", None)
+        if str(actual_attn) != str(attn_implementation):
+            raise RuntimeError(
+                "Requested attention implementation was not honored: "
+                f"requested={attn_implementation!r}, actual={actual_attn!r}."
+            )
     return HfModelBundle(model=model, tokenizer=tokenizer, device=device_obj)
 
 
@@ -564,6 +576,7 @@ def run_hf_prefill(
     observation_blocks: list[torch.Tensor] = []
     past_key_values = None
     next_token_id = None
+    next_token_logits = None
     include_cache_position = (
         "cache_position" in inspect.signature(model.forward).parameters
     )
@@ -600,6 +613,17 @@ def run_hf_prefill(
 
             outputs = model(**forward_kwargs)
             attentions = outputs.attentions
+            if outputs.logits is None:
+                raise ValueError("Model output did not include prefill logits.")
+            require_finite_tensor(
+                "prefill_logits",
+                outputs.logits,
+                stage="prefill",
+                sample_id=sample_id,
+                block_index=prefill_blocks,
+                block_start=start,
+                block_end=end,
+            )
             if not attentions:
                 raise ValueError(
                     "Model output did not include attentions. Use an attention "
@@ -612,6 +636,16 @@ def run_hf_prefill(
             )
             if first_attention is None:
                 raise ValueError("Every model attention layer returned None.")
+            for attention_layer, attention in enumerate(attentions):
+                if attention is not None:
+                    require_finite_tensor(
+                        "prefill_attention",
+                        attention,
+                        stage="prefill",
+                        sample_id=sample_id,
+                        block_index=prefill_blocks,
+                        layer=attention_layer,
+                    )
             query_len = int(first_attention.shape[-2])
             key_len = int(first_attention.shape[-1])
             if query_len != end - start:
@@ -651,8 +685,41 @@ def run_hf_prefill(
                 )
 
             past_key_values = outputs.past_key_values
-            if outputs.logits is not None:
-                next_token_id = int(torch.argmax(outputs.logits[0, -1, :]).item())
+            for cache_layer, (key, value) in enumerate(
+                cache_layer_tensors(past_key_values)
+            ):
+                require_finite_tensor(
+                    "prefill_key_slice",
+                    key[..., -query_len:, :],
+                    stage="prefill",
+                    sample_id=sample_id,
+                    block_index=prefill_blocks,
+                    layer=cache_layer,
+                )
+                require_finite_tensor(
+                    "prefill_value_slice",
+                    value[..., -query_len:, :],
+                    stage="prefill",
+                    sample_id=sample_id,
+                    block_index=prefill_blocks,
+                    layer=cache_layer,
+                )
+            final_logits = outputs.logits[0, -1, :]
+            require_finite_tensor(
+                "prefill_next_token_logits",
+                final_logits,
+                stage="prefill_argmax",
+                sample_id=sample_id,
+                block_index=prefill_blocks,
+            )
+            next_token_id = int(torch.argmax(final_logits).item())
+            next_token_logits = final_logits.detach().cpu().clone()
+            validate_token_ids(
+                [next_token_id],
+                vocab_size=getattr(getattr(model, "config", None), "vocab_size", None),
+                name="prefill_next_token_id",
+                sample_id=sample_id,
+            )
             prefill_blocks += 1
             if graph_builder is not None:
                 del graph_rows
@@ -662,6 +729,12 @@ def run_hf_prefill(
         raise RuntimeError("No observation attention rows were collected during prefill.")
     attention_query_axis = 2 if attention_mode.lower() == "all" else 1
     attention_obs = torch.cat(observation_blocks, dim=attention_query_axis)
+    require_finite_tensor(
+        "attention_observation",
+        attention_obs,
+        stage="prefill_finalize",
+        sample_id=sample_id,
+    )
     expected_observations = min(int(observation_window), sequence_length)
     if int(attention_obs.shape[attention_query_axis]) != expected_observations:
         raise RuntimeError("Blockwise prefill collected an incomplete observation window.")
@@ -672,6 +745,12 @@ def run_hf_prefill(
     k_cache, v_cache = extract_full_kv_cache(
         past_key_values,
         offload_to_cpu=offload_to_cpu,
+    )
+    require_finite_tensor(
+        "prefill_k_cache", k_cache, stage="prefill_finalize", sample_id=sample_id
+    )
+    require_finite_tensor(
+        "prefill_v_cache", v_cache, stage="prefill_finalize", sample_id=sample_id
     )
     if int(k_cache.shape[-2]) != sequence_length:
         raise ValueError(
@@ -690,6 +769,7 @@ def run_hf_prefill(
         v_cache=v_cache,
         dependency_graph=dependency_graph,
         next_token_id=next_token_id,
+        next_token_logits=next_token_logits,
         max_chunk_tokens=chunk_constructor.max_chunk_tokens,
         prefill_block_size=block_size,
         prefill_blocks=prefill_blocks,
@@ -723,17 +803,47 @@ def generate_text(
         raise ValueError("Prepared prompt does not match the supplied raw prompt.")
     encoded = _prepared_inputs_on_device(prepared_prompt, device)
 
+    try:
+        from transformers import LogitsProcessor, LogitsProcessorList
+    except ModuleNotFoundError as exc:  # pragma: no cover - model already requires HF
+        raise ModuleNotFoundError(
+            "HuggingFace generation requires `transformers`."
+        ) from exc
+
+    class _FiniteLogitsProcessor(LogitsProcessor):
+        def __init__(self) -> None:
+            self.step = 0
+
+        def __call__(
+            self,
+            input_ids: torch.LongTensor,
+            scores: torch.FloatTensor,
+        ) -> torch.FloatTensor:
+            require_finite_tensor(
+                "native_generation_logits",
+                scores,
+                stage="native_generation_argmax",
+                decode_step=self.step,
+            )
+            self.step += 1
+            return scores
+
     with torch.no_grad():
         generated = model.generate(
             **encoded,
             max_new_tokens=int(max_new_tokens),
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
+            logits_processor=LogitsProcessorList([_FiniteLogitsProcessor()]),
         )
 
     prompt_len = int(encoded["input_ids"].shape[1])
     continuation = generated[0, prompt_len:]
-    token_ids = tuple(int(token_id) for token_id in continuation.detach().cpu().tolist())
+    token_ids = validate_token_ids(
+        continuation,
+        vocab_size=getattr(getattr(model, "config", None), "vocab_size", None),
+        name="native_generated_token_ids",
+    )
     result = HfGenerationResult(
         text=tokenizer.decode(continuation, skip_special_tokens=True).strip(),
         token_ids=token_ids,
@@ -804,6 +914,15 @@ def generate_text_with_evicted_cache(
         return empty_result if return_details else empty_result.text
 
     device = model_device(model)
+    vocab_size = getattr(getattr(model, "config", None), "vocab_size", None)
+    validate_token_ids(
+        [first_new_token_id],
+        vocab_size=vocab_size,
+        name="first_new_token_id",
+        stage="decode_init",
+    )
+    require_finite_tensor("decode_initial_k_cache", k_cache, stage="decode_init")
+    require_finite_tensor("decode_initial_v_cache", v_cache, stage="decode_init")
     cache_manager = None
     if budget is not None:
         if kept_indices is None:
@@ -855,7 +974,7 @@ def generate_text_with_evicted_cache(
         )
 
         # We already generated the first token from the prefill step, so we need max_new_tokens - 1 more
-        for _ in range(max_new_tokens - 1):
+        for decode_step in range(max_new_tokens - 1):
             forward_kwargs = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -872,6 +991,32 @@ def generate_text_with_evicted_cache(
             with torch.no_grad():
                 outputs = model(**forward_kwargs)
 
+            if outputs.logits is None:
+                raise ValueError("Model output did not include decode logits.")
+            require_finite_tensor(
+                "decode_logits",
+                outputs.logits,
+                stage="decode",
+                decode_step=decode_step,
+            )
+            for cache_layer, (key, value) in enumerate(
+                cache_layer_tensors(outputs.past_key_values)
+            ):
+                require_finite_tensor(
+                    "decode_key_slice",
+                    key[..., -1:, :],
+                    stage="decode",
+                    decode_step=decode_step,
+                    layer=cache_layer,
+                )
+                require_finite_tensor(
+                    "decode_value_slice",
+                    value[..., -1:, :],
+                    stage="decode",
+                    decode_step=decode_step,
+                    layer=cache_layer,
+                )
+
             if cache_manager is not None:
                 processed_position = int(position_ids.item())
                 cache_manager.append_generated_token(
@@ -885,12 +1030,24 @@ def generate_text_with_evicted_cache(
                 past_key_values = outputs.past_key_values
 
             next_token_logits = outputs.logits[:, -1, :]
+            require_finite_tensor(
+                "decode_next_token_logits",
+                next_token_logits,
+                stage="decode_argmax",
+                decode_step=decode_step,
+            )
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            generated_tokens.append(next_token.item())
+            next_token_id = validate_token_ids(
+                next_token,
+                vocab_size=vocab_size,
+                name="decode_next_token_id",
+                decode_step=decode_step,
+            )[0]
+            generated_tokens.append(next_token_id)
             
             # Match Transformers.generate(), which uses the model generation
             # configuration and may define more than one EOS token.
-            if int(next_token.item()) in eos_token_ids:
+            if next_token_id in eos_token_ids:
                 break
                 
             input_ids = next_token
@@ -914,10 +1071,16 @@ def generate_text_with_evicted_cache(
         text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
         cache_summary = cache_manager.summary() if cache_manager is not None else {}
         cache_summary["generated_tokens"] = len(generated_tokens)
+        validated_tokens = validate_token_ids(
+            generated_tokens,
+            vocab_size=vocab_size,
+            name="generated_token_ids",
+            stage="decode_finalize",
+        )
         result = EvictedGenerationResult(
             text=text,
             cache_summary=cache_summary,
-            token_ids=tuple(int(token_id) for token_id in generated_tokens),
+            token_ids=validated_tokens,
         )
         return result if return_details else result.text
 
@@ -935,6 +1098,7 @@ __all__ = [
     "generate_text_with_evicted_cache",
     "load_hf_model_and_tokenizer",
     "model_device",
+    "prepare_prompt",
     "resolve_device",
     "resolve_torch_dtype",
     "run_hf_prefill",
