@@ -13,6 +13,7 @@ from src.models.cache_utils import (
     EvictedGenerationResult,
     HfModelBundle,
     HfGenerationResult,
+    apply_repetition_penalty,
     build_position_kwargs,
     extended_rotary_position_capacity,
     generate_text,
@@ -160,6 +161,51 @@ def _dynamic_cache(k_cache, v_cache):
     )
 
 
+def test_repetition_penalty_matches_transformers_sign_rule():
+    logits = torch.tensor([4.0, -4.0, 3.0, -3.0])
+
+    adjusted = apply_repetition_penalty(
+        logits,
+        torch.tensor([0, 1, 1]),
+        penalty=2.0,
+    )
+
+    assert torch.equal(adjusted, torch.tensor([2.0, -8.0, 3.0, -3.0]))
+
+
+def test_nondefault_repetition_penalty_preserves_native_custom_parity():
+    model = _model_for_family("qwen2")
+    tokenizer = _TokenFixture()
+    original_penalty = model.generation_config.repetition_penalty
+    model.generation_config.repetition_penalty = 1.2
+    try:
+        native = generate_text(
+            model=model,
+            tokenizer=tokenizer,
+            prompt="ignored",
+            max_new_tokens=5,
+            return_details=True,
+        )
+        prefill = _prefill("qwen2")
+        custom = generate_text_with_evicted_cache(
+            model=model,
+            tokenizer=tokenizer,
+            first_new_token_id=prefill.next_token_id,
+            prompt_token_ids=prefill.input_ids,
+            max_new_tokens=5,
+            k_cache=prefill.k_cache,
+            v_cache=prefill.v_cache,
+            original_sequence_length=prefill.sequence_length,
+            return_details=True,
+        )
+    finally:
+        model.generation_config.repetition_penalty = original_penalty
+
+    assert prefill.next_token_id == native.token_ids[0]
+    assert custom.token_ids == native.token_ids
+    assert custom.text == native.text
+
+
 @pytest.mark.parametrize("family", ["gpt2", "llama", "qwen2"])
 def test_unpruned_custom_cache_generation_matches_fullkv_token_ids(family):
     model = _model_for_family(family)
@@ -260,6 +306,8 @@ def test_hf_grid_records_protocol_judgment_hashes_and_parity(tmp_path, monkeypat
     assert payload["protocols"]["gsm8k_chunkkv"]["shots"] == 8
     assert payload["summary"]["fullkv_parity"]["all_passed"] is True
     assert payload["summary"]["qualification"]["passed"] is True
+    assert payload["generation_policies"]["tiny/qwen2"]["do_sample"] is False
+    assert run["config"]["generation_policy"]["repetition_penalty"] == 1.0
     assert run["protocol"] == CHUNKKV_GSM8K_8SHOT_PROTOCOL
     assert run["prompt_serialization"] == "chat"
     assert run["config"]["prompt_serialization"] == "chat"

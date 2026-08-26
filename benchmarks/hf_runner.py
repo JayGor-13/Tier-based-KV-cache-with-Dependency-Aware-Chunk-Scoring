@@ -75,6 +75,7 @@ from src.models.cache_utils import (
     generate_text_with_evicted_cache,
     load_hf_model_and_tokenizer,
     prepare_prompt,
+    resolve_greedy_generation_policy,
     run_hf_prefill,
 )
 
@@ -1466,6 +1467,7 @@ def run_hf_grid(
         "max_vram_fraction": float(max_vram_fraction),
         "environment_signature": environment_signature,
         "orchestration_job_id": orchestration_job_id,
+        "generation_policy_contract": "greedy_model_repetition_penalty_v1",
     }
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
 
@@ -1589,6 +1591,7 @@ def run_hf_grid(
     resolved_model_revisions: dict[str, str | None] = {}
     model_preflights: dict[str, dict[str, Any]] = {}
     model_load_measurements: dict[str, dict] = {}
+    resolved_generation_policies: dict[str, dict[str, Any]] = {}
     max_observation_window = max(1, max(int(window) for window in recent_windows))
 
     def report(message: str) -> None:
@@ -1627,6 +1630,11 @@ def run_hf_grid(
             device=measurement_device,
         )
         bundle = model_load.value
+        generation_policy = resolve_greedy_generation_policy(
+            bundle.model,
+            bundle.tokenizer,
+        )
+        resolved_generation_policies[model_name] = generation_policy.to_dict()
         model_load_measurements[model_name] = model_load.measurement.to_dict()
         model_revision = _model_revision(bundle) or (
             hub_preflight.get("resolved_revision") if hub_preflight else None
@@ -1768,6 +1776,7 @@ def run_hf_grid(
                             model=bundle.model,
                             tokenizer=bundle.tokenizer,
                             first_new_token_id=int(prefill.next_token_id or 0),
+                            prompt_token_ids=prefill.input_ids,
                             max_new_tokens=max_new_tokens,
                             k_cache=prefill.k_cache,
                             v_cache=prefill.v_cache,
@@ -1842,6 +1851,7 @@ def run_hf_grid(
                         "token_match": (
                             parity_generation.token_ids == full_generation.token_ids
                         ),
+                        "generation_policy": generation_policy.to_dict(),
                         "runtime": combine_measurements(
                             huggingface_generation=parity_call.measurement,
                             controlled_prefill=prefill_call.measurement,
@@ -1910,6 +1920,7 @@ def run_hf_grid(
                         "max_length": max_length,
                         "max_new_tokens": int(max_new_tokens),
                         "do_sample": False,
+                        "generation_policy": generation_policy.to_dict(),
                         "seed": int(seed),
                         "experiment_variant": str(experiment_variant),
                         "method_metadata": METHOD_METADATA["fullkv"],
@@ -2188,6 +2199,7 @@ def run_hf_grid(
                                 "max_length": max_length,
                                 "max_new_tokens": int(max_new_tokens),
                                 "do_sample": False,
+                                "generation_policy": generation_policy.to_dict(),
                                 "seed": int(seed),
                                 "decode_policy": decode_policy,
                                 "experiment_variant": str(experiment_variant),
@@ -2280,6 +2292,7 @@ def run_hf_grid(
                                             model=bundle.model,
                                             tokenizer=bundle.tokenizer,
                                             first_new_token_id=prefill.next_token_id,
+                                            prompt_token_ids=prefill.input_ids,
                                             max_new_tokens=max_new_tokens,
                                             k_cache=eviction.new_k_cache,
                                             v_cache=eviction.new_v_cache,
@@ -2617,6 +2630,7 @@ def run_hf_grid(
         "model_preflights": model_preflights,
         "environment": environment_metadata,
         "model_load_runtime": model_load_measurements,
+        "generation_policies": resolved_generation_policies,
         "experiment_fingerprint": experiment_fingerprint,
         "orchestration_job_id": orchestration_job_id,
         "job_fingerprint": experiment_fingerprint,
@@ -2680,6 +2694,7 @@ def run_hf_grid(
             "method_metadata": {
                 method: METHOD_METADATA[method] for method in experiment_methods
             },
+            "generation_policy_contract": "greedy_model_repetition_penalty_v1",
         },
         "summary": {
             "total_runs": len(runs),

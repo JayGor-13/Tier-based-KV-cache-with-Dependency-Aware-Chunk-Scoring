@@ -31,6 +31,7 @@ from src.models.cache_utils import (
     generate_text,
     load_hf_model_and_tokenizer,
     prepare_prompt,
+    resolve_greedy_generation_policy,
 )
 
 
@@ -188,6 +189,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         trust_remote_code=args.trust_remote_code,
         attn_implementation=None,
     )
+    generation_policy = resolve_greedy_generation_policy(
+        bundle.model,
+        bundle.tokenizer,
+    )
 
     results: list[dict[str, Any]] = []
     for index, record in enumerate(records, start=1):
@@ -261,6 +266,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "max_length": args.max_length,
             "serialization": args.serialization,
             "do_sample": False,
+            "policy": generation_policy.to_dict(),
             "seed": args.seed,
         },
         "summary": summary,

@@ -151,6 +151,7 @@ def test_native_answer_main_saves_raw_prompt_and_passes_nonzero_gate(
 
     assert exit_code == 0
     assert payload["summary"]["accuracy"] == 1.0
+    assert payload["generation"]["policy"]["repetition_penalty"] == 1.0
     assert payload["records"][0]["raw_prompt"].endswith("Answer:")
     assert payload["records"][0]["rendered_prompt"] == "rendered prompt"
 

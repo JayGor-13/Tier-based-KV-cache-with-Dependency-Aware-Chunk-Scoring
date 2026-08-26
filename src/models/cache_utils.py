@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import inspect
+import math
 from typing import Any, Sequence
 
 import torch
@@ -84,6 +85,25 @@ class HfGenerationResult:
 
 
 @dataclass(frozen=True)
+class GreedyGenerationPolicy:
+    """Deterministic logits/stopping contract shared by every decode path."""
+
+    repetition_penalty: float
+    eos_token_ids: tuple[int, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": "greedy_model_repetition_penalty_v1",
+            "do_sample": False,
+            "num_beams": 1,
+            "repetition_penalty": float(self.repetition_penalty),
+            "repetition_history": "full_prompt_plus_generated_tokens",
+            "eos_token_ids": list(self.eos_token_ids),
+            "stopping": "eos_or_max_new_tokens",
+        }
+
+
+@dataclass(frozen=True)
 class EvictedGenerationResult:
     """Generated text plus bounded-cache diagnostics."""
 
@@ -121,6 +141,84 @@ def resolve_torch_dtype(
     if dtype in {"float32", "fp32"}:
         return torch.float32
     raise ValueError(f"Unsupported dtype `{dtype}`.")
+
+
+def resolve_greedy_generation_policy(
+    model: Any,
+    tokenizer: Any,
+) -> GreedyGenerationPolicy:
+    """Resolve the model's repetition penalty and EOS set for greedy decoding."""
+    generation_config = getattr(model, "generation_config", None)
+    penalty = getattr(generation_config, "repetition_penalty", 1.0)
+    penalty = 1.0 if penalty is None else float(penalty)
+    if not math.isfinite(penalty) or penalty <= 0.0:
+        raise ValueError("generation repetition_penalty must be finite and positive.")
+
+    configured_eos = getattr(generation_config, "eos_token_id", None)
+    if configured_eos is None:
+        configured_eos = getattr(getattr(model, "config", None), "eos_token_id", None)
+    if configured_eos is None:
+        configured_eos = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(configured_eos, (list, tuple, set)):
+        eos_token_ids = tuple(dict.fromkeys(int(value) for value in configured_eos))
+    elif configured_eos is None:
+        eos_token_ids = ()
+    else:
+        eos_token_ids = (int(configured_eos),)
+    return GreedyGenerationPolicy(
+        repetition_penalty=penalty,
+        eos_token_ids=eos_token_ids,
+    )
+
+
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    token_history: torch.Tensor | Sequence[int],
+    *,
+    penalty: float,
+) -> torch.Tensor:
+    """Apply the Transformers repetition-penalty rule to complete token history."""
+    penalty = float(penalty)
+    if not math.isfinite(penalty) or penalty <= 0.0:
+        raise ValueError("repetition penalty must be finite and positive.")
+    require_finite_tensor("generation_logits_before_repetition_penalty", logits)
+    squeeze_batch = logits.ndim == 1
+    if squeeze_batch:
+        scores = logits.unsqueeze(0).clone()
+    elif logits.ndim == 2:
+        scores = logits.clone()
+    else:
+        raise ValueError("generation logits must have shape [vocab] or [batch, vocab].")
+
+    if isinstance(token_history, torch.Tensor):
+        history = token_history.to(device=scores.device, dtype=torch.long)
+    else:
+        history = torch.tensor(
+            list(token_history),
+            dtype=torch.long,
+            device=scores.device,
+        )
+    if history.ndim == 1:
+        history = history.unsqueeze(0)
+    if history.ndim != 2 or history.shape[0] != scores.shape[0]:
+        raise ValueError("token history must have shape [batch, sequence].")
+    if history.numel() == 0 or penalty == 1.0:
+        return scores.squeeze(0) if squeeze_batch else scores
+    validate_token_ids(
+        history,
+        vocab_size=int(scores.shape[-1]),
+        name="generation_repetition_history",
+    )
+
+    gathered = torch.gather(scores, 1, history)
+    adjusted = torch.where(
+        gathered < 0,
+        gathered * penalty,
+        gathered / penalty,
+    )
+    scores.scatter_(1, history, adjusted)
+    require_finite_tensor("generation_logits_after_repetition_penalty", scores)
+    return scores.squeeze(0) if squeeze_batch else scores
 
 
 def load_hf_model_and_tokenizer(
@@ -581,6 +679,7 @@ def run_hf_prefill(
         "cache_position" in inspect.signature(model.forward).parameters
     )
     prefill_blocks = 0
+    generation_policy = resolve_greedy_generation_policy(model, tokenizer)
 
     with torch.no_grad():
         for start in range(0, sequence_length, block_size):
@@ -712,8 +811,13 @@ def run_hf_prefill(
                 sample_id=sample_id,
                 block_index=prefill_blocks,
             )
-            next_token_id = int(torch.argmax(final_logits).item())
-            next_token_logits = final_logits.detach().cpu().clone()
+            processed_final_logits = apply_repetition_penalty(
+                final_logits,
+                input_ids[:, :end],
+                penalty=generation_policy.repetition_penalty,
+            )
+            next_token_id = int(torch.argmax(processed_final_logits).item())
+            next_token_logits = processed_final_logits.detach().cpu().clone()
             validate_token_ids(
                 [next_token_id],
                 vocab_size=getattr(getattr(model, "config", None), "vocab_size", None),
@@ -828,11 +932,23 @@ def generate_text(
             self.step += 1
             return scores
 
+    generation_policy = resolve_greedy_generation_policy(model, tokenizer)
+    eos_token_id: int | list[int] | None
+    if len(generation_policy.eos_token_ids) == 1:
+        eos_token_id = generation_policy.eos_token_ids[0]
+    elif generation_policy.eos_token_ids:
+        eos_token_id = list(generation_policy.eos_token_ids)
+    else:
+        eos_token_id = None
+
     with torch.no_grad():
         generated = model.generate(
             **encoded,
             max_new_tokens=int(max_new_tokens),
             do_sample=False,
+            num_beams=1,
+            repetition_penalty=generation_policy.repetition_penalty,
+            eos_token_id=eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
             logits_processor=LogitsProcessorList([_FiniteLogitsProcessor()]),
         )
@@ -900,6 +1016,7 @@ def generate_text_with_evicted_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     original_sequence_length: int,
+    prompt_token_ids: torch.Tensor | Sequence[int] | None = None,
     budget: int | None = None,
     kept_indices: torch.Tensor | None = None,
     chunks: Sequence[torch.Tensor] | None = None,
@@ -915,6 +1032,20 @@ def generate_text_with_evicted_cache(
 
     device = model_device(model)
     vocab_size = getattr(getattr(model, "config", None), "vocab_size", None)
+    generation_policy = resolve_greedy_generation_policy(model, tokenizer)
+    if prompt_token_ids is None:
+        if generation_policy.repetition_penalty != 1.0:
+            raise ValueError(
+                "prompt_token_ids is required when repetition_penalty is not 1.0."
+            )
+        prompt_history: tuple[int, ...] = ()
+    else:
+        prompt_history = validate_token_ids(
+            prompt_token_ids,
+            vocab_size=vocab_size,
+            name="decode_prompt_token_ids",
+            stage="decode_init",
+        )
     validate_token_ids(
         [first_new_token_id],
         vocab_size=vocab_size,
@@ -958,20 +1089,29 @@ def generate_text_with_evicted_cache(
         position_ids = torch.tensor([[original_sequence_length]], dtype=torch.long, device=device)
 
         generated_tokens = [first_new_token_id]
-        configured_eos = getattr(
-            getattr(model, "generation_config", None), "eos_token_id", None
+        repetition_history = torch.tensor(
+            [list(prompt_history) + generated_tokens],
+            dtype=torch.long,
+            device=device,
         )
-        if configured_eos is None:
-            configured_eos = getattr(tokenizer, "eos_token_id", None)
-        if isinstance(configured_eos, (list, tuple, set)):
-            eos_token_ids = {int(token_id) for token_id in configured_eos}
-        elif configured_eos is None:
-            eos_token_ids = set()
-        else:
-            eos_token_ids = {int(configured_eos)}
+        eos_token_ids = set(generation_policy.eos_token_ids)
         include_cache_position = (
             "cache_position" in inspect.signature(model.forward).parameters
         )
+
+        if first_new_token_id in eos_token_ids:
+            text = tokenizer.decode(
+                generated_tokens,
+                skip_special_tokens=True,
+            ).strip()
+            cache_summary = cache_manager.summary() if cache_manager is not None else {}
+            cache_summary["generated_tokens"] = len(generated_tokens)
+            result = EvictedGenerationResult(
+                text=text,
+                cache_summary=cache_summary,
+                token_ids=tuple(generated_tokens),
+            )
+            return result if return_details else result.text
 
         # We already generated the first token from the prefill step, so we need max_new_tokens - 1 more
         for decode_step in range(max_new_tokens - 1):
@@ -1036,7 +1176,16 @@ def generate_text_with_evicted_cache(
                 stage="decode_argmax",
                 decode_step=decode_step,
             )
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            processed_next_token_logits = apply_repetition_penalty(
+                next_token_logits,
+                repetition_history,
+                penalty=generation_policy.repetition_penalty,
+            )
+            next_token = torch.argmax(
+                processed_next_token_logits,
+                dim=-1,
+                keepdim=True,
+            )
             next_token_id = validate_token_ids(
                 next_token,
                 vocab_size=vocab_size,
@@ -1044,6 +1193,10 @@ def generate_text_with_evicted_cache(
                 decode_step=decode_step,
             )[0]
             generated_tokens.append(next_token_id)
+            repetition_history = torch.cat(
+                (repetition_history, next_token.to(dtype=torch.long)),
+                dim=1,
+            )
             
             # Match Transformers.generate(), which uses the model generation
             # configuration and may define more than one EOS token.
@@ -1086,10 +1239,12 @@ def generate_text_with_evicted_cache(
 
 
 __all__ = [
+    "GreedyGenerationPolicy",
     "HfModelBundle",
     "HfPrefillRecord",
     "HfGenerationResult",
     "EvictedGenerationResult",
+    "apply_repetition_penalty",
     "build_position_kwargs",
     "extended_rotary_position_capacity",
     "extract_attention_obs",
@@ -1099,6 +1254,7 @@ __all__ = [
     "load_hf_model_and_tokenizer",
     "model_device",
     "prepare_prompt",
+    "resolve_greedy_generation_policy",
     "resolve_device",
     "resolve_torch_dtype",
     "run_hf_prefill",

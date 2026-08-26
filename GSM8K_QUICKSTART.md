@@ -88,7 +88,9 @@ This runs:
 It prints a small table with parse rate, accuracy, total latency, and decode
 tokens/second. The complete result is saved to
 `outputs/gsm8k/compression.json`. The command fails if native and custom FullKV
-generation do not match.
+generation do not match. The JSON records the effective repetition penalty,
+full token-history scope, EOS token IDs, and stopping rule applied identically
+to native, FullKV, and compressed decoding.
 
 ## 5. Scale slowly
 
