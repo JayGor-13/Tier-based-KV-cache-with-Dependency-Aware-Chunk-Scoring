@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=9.1,<10"]
+gpu = ["bitsandbytes>=0.45,<1"]
 
 [tool.setuptools.packages.find]
 include = ["src*", "benchmarks*"]

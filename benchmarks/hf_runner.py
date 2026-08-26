@@ -74,6 +74,7 @@ from src.models.cache_utils import (
     generate_text,
     generate_text_with_evicted_cache,
     load_hf_model_and_tokenizer,
+    normalize_quantization_mode,
     prepare_prompt,
     resolve_greedy_generation_policy,
     run_hf_prefill,
@@ -1307,6 +1308,10 @@ def run_hf_grid(
     dtype: str = "auto",
     trust_remote_code: bool = False,
     attn_implementation: str | None = "eager",
+    quantization: str = "none",
+    bnb_4bit_compute_dtype: str = "float16",
+    bnb_4bit_quant_type: str = "nf4",
+    bnb_4bit_use_double_quant: bool = True,
     hf_token: str | None = None,
     allow_level2_fallback: bool = True,
     continue_on_error: bool = True,
@@ -1322,6 +1327,7 @@ def run_hf_grid(
     sample_shard_count: int = 1,
     require_model_preflight: bool = False,
     preflight_require_cuda: bool = False,
+    preflight_require_unquantized: bool = True,
     max_vram_fraction: float = 0.90,
     deterministic: bool = True,
     orchestration_job_id: str | None = None,
@@ -1347,6 +1353,10 @@ def run_hf_grid(
         raise ValueError("sample_shard_index must be in [0, sample_shard_count).")
     if not 0.0 < float(max_vram_fraction) <= 1.0:
         raise ValueError("max_vram_fraction must be in (0, 1].")
+    quantization = normalize_quantization_mode(quantization)
+    bnb_4bit_quant_type = str(bnb_4bit_quant_type).strip().lower()
+    if bnb_4bit_quant_type not in {"nf4", "fp4"}:
+        raise ValueError("bnb_4bit_quant_type must be `nf4` or `fp4`.")
     if max_length is not None and int(max_length) <= 0:
         raise ValueError("max_length must be positive when provided.")
     if prefill_block_size <= 0:
@@ -1452,6 +1462,10 @@ def run_hf_grid(
         "dtype": str(dtype),
         "trust_remote_code": bool(trust_remote_code),
         "attn_implementation": attn_implementation,
+        "quantization": quantization,
+        "bnb_4bit_compute_dtype": str(bnb_4bit_compute_dtype),
+        "bnb_4bit_quant_type": bnb_4bit_quant_type,
+        "bnb_4bit_use_double_quant": bool(bnb_4bit_use_double_quant),
         "prompt_serialization": prompt_serialization,
         "truncation_side": truncation_side,
         "decode_policy": decode_policy,
@@ -1464,6 +1478,7 @@ def run_hf_grid(
         "sample_shard_count": int(sample_shard_count),
         "require_model_preflight": bool(require_model_preflight),
         "preflight_require_cuda": bool(preflight_require_cuda),
+        "preflight_require_unquantized": bool(preflight_require_unquantized),
         "max_vram_fraction": float(max_vram_fraction),
         "environment_signature": environment_signature,
         "orchestration_job_id": orchestration_job_id,
@@ -1591,6 +1606,7 @@ def run_hf_grid(
     resolved_model_revisions: dict[str, str | None] = {}
     model_preflights: dict[str, dict[str, Any]] = {}
     model_load_measurements: dict[str, dict] = {}
+    model_load_configurations: dict[str, dict[str, Any]] = {}
     resolved_generation_policies: dict[str, dict[str, Any]] = {}
     max_observation_window = max(1, max(int(window) for window in recent_windows))
 
@@ -1610,6 +1626,7 @@ def run_hf_grid(
                 check_local_accelerator=True,
                 require_cuda=preflight_require_cuda,
                 max_vram_fraction=max_vram_fraction,
+                quantization=quantization,
             )
             enforce_preflight(hub_preflight)
         measurement_device = (
@@ -1626,6 +1643,10 @@ def run_hf_grid(
                 dtype=dtype,
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
+                quantization=quantization,
+                bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+                bnb_4bit_quant_type=bnb_4bit_quant_type,
+                bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
             ),
             device=measurement_device,
         )
@@ -1636,6 +1657,7 @@ def run_hf_grid(
         )
         resolved_generation_policies[model_name] = generation_policy.to_dict()
         model_load_measurements[model_name] = model_load.measurement.to_dict()
+        model_load_configurations[model_name] = dict(bundle.load_metadata)
         model_revision = _model_revision(bundle) or (
             hub_preflight.get("resolved_revision") if hub_preflight else None
         )
@@ -1653,7 +1675,13 @@ def run_hf_grid(
             max_vram_fraction=max_vram_fraction,
             requested_dtype=dtype,
             requested_attention_backend=attn_implementation,
-            require_unquantized=require_model_preflight,
+            requested_quantization=quantization,
+            requested_quantization_compute_dtype=(
+                bnb_4bit_compute_dtype if quantization == "bnb-4bit" else None
+            ),
+            require_unquantized=(
+                require_model_preflight and preflight_require_unquantized
+            ),
         )
         preflight = {
             "passed": runtime_preflight.get("passed") is True
@@ -1851,6 +1879,7 @@ def run_hf_grid(
                         "token_match": (
                             parity_generation.token_ids == full_generation.token_ids
                         ),
+                        "model_loading": dict(bundle.load_metadata),
                         "generation_policy": generation_policy.to_dict(),
                         "runtime": combine_measurements(
                             huggingface_generation=parity_call.measurement,
@@ -1920,6 +1949,7 @@ def run_hf_grid(
                         "max_length": max_length,
                         "max_new_tokens": int(max_new_tokens),
                         "do_sample": False,
+                        "model_loading": dict(bundle.load_metadata),
                         "generation_policy": generation_policy.to_dict(),
                         "seed": int(seed),
                         "experiment_variant": str(experiment_variant),
@@ -1961,7 +1991,7 @@ def run_hf_grid(
                         method="fullkv",
                         config=full_config,
                         experiment_fingerprint=experiment_fingerprint,
-                        actual_dtype=runtime_preflight.get("dominant_parameter_dtype"),
+                        actual_dtype=runtime_preflight.get("effective_compute_dtype"),
                         actual_attention_backend=runtime_preflight.get(
                             "attention_backend"
                         ),
@@ -2199,6 +2229,7 @@ def run_hf_grid(
                                 "max_length": max_length,
                                 "max_new_tokens": int(max_new_tokens),
                                 "do_sample": False,
+                                "model_loading": dict(bundle.load_metadata),
                                 "generation_policy": generation_policy.to_dict(),
                                 "seed": int(seed),
                                 "decode_policy": decode_policy,
@@ -2218,7 +2249,7 @@ def run_hf_grid(
                                 config=config,
                                 experiment_fingerprint=experiment_fingerprint,
                                 actual_dtype=runtime_preflight.get(
-                                    "dominant_parameter_dtype"
+                                    "effective_compute_dtype"
                                 ),
                                 actual_attention_backend=runtime_preflight.get(
                                     "attention_backend"
@@ -2630,6 +2661,7 @@ def run_hf_grid(
         "model_preflights": model_preflights,
         "environment": environment_metadata,
         "model_load_runtime": model_load_measurements,
+        "model_loading": model_load_configurations,
         "generation_policies": resolved_generation_policies,
         "experiment_fingerprint": experiment_fingerprint,
         "orchestration_job_id": orchestration_job_id,
@@ -2687,9 +2719,16 @@ def run_hf_grid(
             "dtype": str(dtype),
             "device": str(device),
             "attn_implementation": attn_implementation,
+            "quantization": quantization,
+            "bnb_4bit_compute_dtype": str(bnb_4bit_compute_dtype),
+            "bnb_4bit_quant_type": bnb_4bit_quant_type,
+            "bnb_4bit_use_double_quant": bool(bnb_4bit_use_double_quant),
             "trust_remote_code": bool(trust_remote_code),
             "require_model_preflight": bool(require_model_preflight),
             "preflight_require_cuda": bool(preflight_require_cuda),
+            "preflight_require_unquantized": bool(
+                preflight_require_unquantized
+            ),
             "max_vram_fraction": float(max_vram_fraction),
             "method_metadata": {
                 method: METHOD_METADATA[method] for method in experiment_methods
@@ -2722,7 +2761,7 @@ def run_hf_grid(
     payload["summary"]["qualification"] = qualification_report(
         payload,
         require_parity=run_fullkv_parity,
-        require_cuda=False,
+        require_cuda=preflight_require_cuda,
         require_fullkv_pairing=bool(compressed_methods),
         expected_parity_records=(
             sum(

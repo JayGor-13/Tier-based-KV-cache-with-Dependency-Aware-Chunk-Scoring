@@ -1,5 +1,8 @@
 # GSM8K quick start
 
+For the staged Qwen2.5-7B-Instruct experiment on a Kaggle T4, including 4-bit
+loading and checkpoint/resume commands, see [KAGGLE_T4_GSM8K.md](KAGGLE_T4_GSM8K.md).
+
 This is the only workflow to use until GSM8K is stable.
 
 ## What we measure

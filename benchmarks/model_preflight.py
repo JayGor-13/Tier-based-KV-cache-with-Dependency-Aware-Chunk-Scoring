@@ -15,6 +15,7 @@ def hub_model_preflight(
     check_local_accelerator: bool = False,
     require_cuda: bool = False,
     max_vram_fraction: float = 0.90,
+    quantization: str = "none",
 ) -> dict[str, Any]:
     """Verify Hub access and resolve the requested ref to an immutable commit."""
     issues: list[str] = []
@@ -46,6 +47,13 @@ def hub_model_preflight(
         repository_weight_bytes = None
         issues.append(f"{type(exc).__name__}: {exc}")
 
+    quantization_name = str(quantization or "none").strip().lower().replace("_", "-")
+    if quantization_name in {"4bit", "bitsandbytes-4bit"}:
+        quantization_name = "bnb-4bit"
+    estimated_loaded_weight_bytes = repository_weight_bytes
+    if repository_weight_bytes is not None and quantization_name == "bnb-4bit":
+        estimated_loaded_weight_bytes = int(repository_weight_bytes / 4)
+
     gpu_total_memory_bytes = None
     if check_local_accelerator:
         if require_cuda and not torch.cuda.is_available():
@@ -53,8 +61,8 @@ def hub_model_preflight(
         if torch.cuda.is_available():
             gpu_total_memory_bytes = int(torch.cuda.get_device_properties(0).total_memory)
             if (
-                repository_weight_bytes is not None
-                and repository_weight_bytes
+                estimated_loaded_weight_bytes is not None
+                and estimated_loaded_weight_bytes
                 > float(max_vram_fraction) * gpu_total_memory_bytes
             ):
                 issues.append(
@@ -70,6 +78,8 @@ def hub_model_preflight(
         "resolved_revision": resolved_revision,
         "authenticated": bool(token),
         "repository_weight_bytes": repository_weight_bytes,
+        "quantization": quantization_name,
+        "estimated_loaded_weight_bytes": estimated_loaded_weight_bytes,
         "gpu_total_memory_bytes": gpu_total_memory_bytes,
         "max_vram_fraction": float(max_vram_fraction),
     }
@@ -96,6 +106,8 @@ def loaded_model_preflight(
     max_vram_fraction: float = 0.90,
     requested_dtype: str | None = None,
     requested_attention_backend: str | None = None,
+    requested_quantization: str = "none",
+    requested_quantization_compute_dtype: str | None = None,
     require_unquantized: bool = False,
 ) -> dict[str, Any]:
     """Validate cache shape assumptions and estimate full-prefill GPU memory."""
@@ -131,7 +143,6 @@ def loaded_model_preflight(
     parameter_bytes = int(
         sum(parameter.numel() * parameter.element_size() for parameter in parameters)
     )
-    element_size = parameters[0].element_size()
     parameter_dtypes = sorted({str(parameter.dtype) for parameter in parameters})
     dtype_bytes: dict[str, int] = {}
     for parameter in parameters:
@@ -140,25 +151,6 @@ def loaded_model_preflight(
             parameter.numel() * parameter.element_size()
         )
     dominant_parameter_dtype = max(dtype_bytes, key=dtype_bytes.get)
-    kv_bytes = int(2 * layers * kv_heads * head_dim * context * element_size)
-    attention_bytes = int(
-        layers
-        * attention_heads
-        * min(max(1, int(prefill_block_size)), max(1, context))
-        * context
-        * element_size
-    )
-    estimated_peak = int(1.20 * (parameter_bytes + kv_bytes + attention_bytes))
-    gpu_total = None
-    if device.type == "cuda" and torch.cuda.is_available():
-        gpu_total = int(torch.cuda.get_device_properties(device).total_memory)
-        if estimated_peak > float(max_vram_fraction) * gpu_total:
-            issues.append(
-                "estimated eager-attention prefill memory exceeds the configured "
-                f"{max_vram_fraction:.0%} VRAM safety limit"
-            )
-    elif not require_cuda:
-        warnings.append("CUDA memory fit was not checked on this device")
 
     attention_backend = getattr(config, "_attn_implementation", None)
     if requested_attention_backend is not None and str(attention_backend) != str(
@@ -184,18 +176,89 @@ def loaded_model_preflight(
         "float32": "torch.float32",
     }
     expected_dtype = dtype_aliases.get(requested_dtype_name)
-    if expected_dtype is not None and dominant_parameter_dtype != expected_dtype:
-        issues.append(
-            "requested dtype was not resolved on model parameters: "
-            f"requested={requested_dtype}, dominant={dominant_parameter_dtype}"
-        )
 
     quantized_4bit = bool(getattr(model, "is_loaded_in_4bit", False))
     quantized_8bit = bool(getattr(model, "is_loaded_in_8bit", False))
     quantization_config = getattr(config, "quantization_config", None)
     is_quantized = bool(quantized_4bit or quantized_8bit or quantization_config)
+    requested_quantization_name = (
+        str(requested_quantization or "none").strip().lower().replace("_", "-")
+    )
+    if requested_quantization_name in {"4bit", "bitsandbytes-4bit"}:
+        requested_quantization_name = "bnb-4bit"
+    if requested_quantization_name == "bnb-4bit" and not quantized_4bit:
+        issues.append(
+            "requested bitsandbytes 4-bit loading was not resolved on the model"
+        )
+    if requested_quantization_name == "none" and is_quantized:
+        issues.append("an unquantized model was requested but a quantized model loaded")
     if require_unquantized and is_quantized:
         issues.append("headline preflight requires an unquantized model")
+
+    def quantization_value(name: str) -> Any:
+        if isinstance(quantization_config, dict):
+            return quantization_config.get(name)
+        return getattr(quantization_config, name, None)
+
+    def canonical_dtype_name(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower().replace("torch.", "")
+        return dtype_aliases.get(normalized)
+
+    quantization_compute_dtype = canonical_dtype_name(
+        quantization_value("bnb_4bit_compute_dtype")
+    )
+    requested_compute_dtype = canonical_dtype_name(
+        requested_quantization_compute_dtype
+    )
+    effective_compute_dtype = (
+        quantization_compute_dtype if is_quantized else dominant_parameter_dtype
+    )
+    if is_quantized:
+        if (
+            requested_compute_dtype is not None
+            and quantization_compute_dtype != requested_compute_dtype
+        ):
+            issues.append(
+                "requested quantization compute dtype was not resolved: "
+                f"requested={requested_quantization_compute_dtype}, "
+                f"actual={quantization_compute_dtype}"
+            )
+    elif expected_dtype is not None and dominant_parameter_dtype != expected_dtype:
+        issues.append(
+            "requested dtype was not resolved on model parameters: "
+            f"requested={requested_dtype}, dominant={dominant_parameter_dtype}"
+        )
+
+    element_sizes = {
+        "torch.float16": 2,
+        "torch.bfloat16": 2,
+        "torch.float32": 4,
+    }
+    element_size = element_sizes.get(
+        effective_compute_dtype,
+        parameters[0].element_size(),
+    )
+    kv_bytes = int(2 * layers * kv_heads * head_dim * context * element_size)
+    attention_bytes = int(
+        layers
+        * attention_heads
+        * min(max(1, int(prefill_block_size)), max(1, context))
+        * context
+        * element_size
+    )
+    estimated_peak = int(1.20 * (parameter_bytes + kv_bytes + attention_bytes))
+    gpu_total = None
+    if device.type == "cuda" and torch.cuda.is_available():
+        gpu_total = int(torch.cuda.get_device_properties(device).total_memory)
+        if estimated_peak > float(max_vram_fraction) * gpu_total:
+            issues.append(
+                "estimated eager-attention prefill memory exceeds the configured "
+                f"{max_vram_fraction:.0%} VRAM safety limit"
+            )
+    elif not require_cuda:
+        warnings.append("CUDA memory fit was not checked on this device")
 
     bf16_supported = None
     gpu_name = None
@@ -205,7 +268,7 @@ def loaded_model_preflight(
         gpu_name = torch.cuda.get_device_name(device)
         capability = torch.cuda.get_device_capability(device)
         compute_capability = [int(capability[0]), int(capability[1])]
-        if expected_dtype == "torch.bfloat16" and not bf16_supported:
+        if effective_compute_dtype == "torch.bfloat16" and not bf16_supported:
             issues.append("requested BF16 but the CUDA device does not support BF16")
 
     return {
@@ -218,9 +281,20 @@ def loaded_model_preflight(
         "attention_backend": attention_backend,
         "requested_attention_backend": requested_attention_backend,
         "requested_dtype": requested_dtype,
+        "requested_quantization": requested_quantization_name,
+        "requested_quantization_compute_dtype": (
+            requested_quantization_compute_dtype
+        ),
         "model_config_torch_dtype": str(getattr(config, "torch_dtype", None)),
         "parameter_dtypes": parameter_dtypes,
         "dominant_parameter_dtype": dominant_parameter_dtype,
+        "effective_compute_dtype": effective_compute_dtype,
+        "quantization_compute_dtype": quantization_compute_dtype,
+        "quantization_config": (
+            quantization_config.to_dict()
+            if hasattr(quantization_config, "to_dict")
+            else quantization_config
+        ),
         "bf16_supported": bf16_supported,
         "gpu_name": gpu_name,
         "compute_capability": compute_capability,

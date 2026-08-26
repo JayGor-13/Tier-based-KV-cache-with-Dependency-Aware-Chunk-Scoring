@@ -13,6 +13,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import torch
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -73,7 +75,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         default="auto",
-        help="auto preserves the checkpoint dtype; bf16 and fp32 are also accepted",
+        help="auto preserves the checkpoint dtype; fp16, bf16, and fp32 are accepted",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        default="eager",
+        help="attention backend; eager matches the compression runner",
+    )
+    parser.add_argument(
+        "--quantization",
+        choices=("none", "bnb-4bit"),
+        default="none",
+    )
+    parser.add_argument(
+        "--bnb-4bit-compute-dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float16",
+    )
+    parser.add_argument(
+        "--bnb-4bit-quant-type",
+        choices=("nf4", "fp4"),
+        default="nf4",
+    )
+    parser.add_argument(
+        "--bnb-4bit-double-quant",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--require-cuda",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="fail before generation unless the loaded model uses CUDA",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hf-token-env", default="HF_TOKEN")
@@ -148,6 +181,14 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             generated_tokens / (elapsed_ms / 1000.0) if elapsed_ms > 0.0 else None
         ),
         "truncated_prompts": sum(bool(row.get("prompt_truncated")) for row in records),
+        "generation_limit_answers": sum(
+            bool(row.get("reached_generation_limit")) for row in records
+        ),
+        "generation_limit_rate": (
+            sum(bool(row.get("reached_generation_limit")) for row in records) / count
+            if count
+            else 0.0
+        ),
     }
 
 
@@ -167,6 +208,8 @@ def _print_record(row: dict[str, Any]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.require_cuda and not torch.cuda.is_available():
+        raise RuntimeError("--require-cuda was set, but PyTorch reports no CUDA device.")
     seed_everything(args.seed, deterministic=True)
     spec = _dataset_spec(
         prompt=args.prompt,
@@ -187,8 +230,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
-        attn_implementation=None,
+        attn_implementation=(
+            None
+            if args.attn_implementation.strip().lower() in {"none", "default"}
+            else args.attn_implementation
+        ),
+        quantization=args.quantization,
+        bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+        bnb_4bit_use_double_quant=args.bnb_4bit_double_quant,
     )
+    if args.require_cuda and bundle.device.type != "cuda":
+        raise RuntimeError(
+            "--require-cuda was set, but the loaded model is not on a CUDA device."
+        )
     generation_policy = resolve_greedy_generation_policy(
         bundle.model,
         bundle.tokenizer,
@@ -238,6 +293,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "correct": judgment["correct"],
             "score": judgment["score"],
             "generated_tokens": len(generation.token_ids),
+            "reached_generation_limit": (
+                len(generation.token_ids) >= args.max_new_tokens
+            ),
             "generated_token_ids": list(generation.token_ids),
             "latency_ms": measured.measurement.elapsed_ms,
             "prompt_tokens": int(prepared.input_ids.shape[1]),
@@ -258,6 +316,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "device": str(bundle.device),
         "requested_dtype": args.dtype,
         "actual_parameter_dtype": _dominant_parameter_dtype(bundle.model),
+        "requested_attention_backend": args.attn_implementation,
+        "actual_attention_backend": getattr(
+            bundle.model.config, "_attn_implementation", None
+        ),
+        "model_loading": dict(bundle.load_metadata),
         "prompt": args.prompt,
         "protocol": PROMPT_PROTOCOLS[args.prompt],
         "dataset": spec.to_dict(),

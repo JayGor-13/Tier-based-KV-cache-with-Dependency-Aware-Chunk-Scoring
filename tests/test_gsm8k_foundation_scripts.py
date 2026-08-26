@@ -7,6 +7,7 @@ import torch
 import scripts.run_gsm8k_compression as compression_script
 import scripts.test_gsm8k_answers as answer_script
 from scripts.run_gsm8k_compression import parse_args as parse_compression_args
+from scripts.run_gsm8k_compression import summarize_paired_quality
 from scripts.run_gsm8k_compression import summarize_runs
 from scripts.test_gsm8k_answers import parse_args as parse_answer_args
 from scripts.test_gsm8k_answers import summarize_records
@@ -19,6 +20,8 @@ def test_native_answer_smoke_defaults_to_small_direct_test():
     assert args.model == "Qwen/Qwen2.5-1.5B-Instruct"
     assert args.samples == 5
     assert args.prompt == "direct"
+    assert args.attn_implementation == "eager"
+    assert args.quantization == "none"
     assert args.require_nonzero_accuracy is True
 
 
@@ -48,6 +51,7 @@ def test_native_answer_summary_tracks_parse_rate_accuracy_and_speed():
     assert summary["accuracy"] == 0.5
     assert summary["generation_tokens_per_second"] == 40.0
     assert summary["truncated_prompts"] == 1
+    assert summary["generation_limit_answers"] == 0
 
 
 def test_compression_cli_uses_explicit_retention_ratios():
@@ -55,6 +59,8 @@ def test_compression_cli_uses_explicit_retention_ratios():
 
     assert args.retention_ratios == [0.5, 0.3]
     assert args.native_parity is True
+    assert args.parity_samples == 5
+    assert args.quantization == "none"
 
     with pytest.raises(SystemExit):
         parse_compression_args(["--retention-ratios", "1.1"])
@@ -100,6 +106,42 @@ def test_compression_summary_separates_fullkv_and_each_retention_ratio():
     assert summary[1]["mean_actual_retention"] == 0.5
 
 
+def test_paired_summary_reports_retention_regressions_and_recoveries():
+    rows = []
+    for sample_id, full_score, compressed_score in (
+        ("a", 1.0, 1.0),
+        ("b", 0.0, 1.0),
+        ("c", 1.0, 0.0),
+    ):
+        rows.extend(
+            [
+                {
+                    "status": "ok",
+                    "method": "fullkv",
+                    "sample_id": sample_id,
+                    "judgment": {"score": full_score},
+                },
+                {
+                    "status": "ok",
+                    "method": "tdc_kv",
+                    "sample_id": sample_id,
+                    "config": {"budget_type": "ratio", "budget_value": 0.8},
+                    "judgment": {"score": compressed_score},
+                },
+            ]
+        )
+
+    summary = summarize_paired_quality(rows)[0]
+
+    assert summary["fullkv_accuracy"] == pytest.approx(2 / 3)
+    assert summary["tdc_kv_accuracy"] == pytest.approx(2 / 3)
+    assert summary["accuracy_delta"] == 0.0
+    assert summary["accuracy_retention"] == 1.0
+    assert summary["paired_correct_preservation"] == 0.5
+    assert summary["regressions"] == 1
+    assert summary["recoveries"] == 1
+
+
 def test_native_answer_main_saves_raw_prompt_and_passes_nonzero_gate(
     monkeypatch,
     tmp_path,
@@ -107,12 +149,16 @@ def test_native_answer_main_saves_raw_prompt_and_passes_nonzero_gate(
     output = tmp_path / "native.json"
     fake_model = SimpleNamespace(
         parameters=lambda: iter([torch.nn.Parameter(torch.zeros(2))]),
-        config=SimpleNamespace(_commit_hash="model-commit"),
+        config=SimpleNamespace(
+            _commit_hash="model-commit",
+            _attn_implementation="eager",
+        ),
     )
     fake_bundle = SimpleNamespace(
         model=fake_model,
         tokenizer=object(),
         device=torch.device("cpu"),
+        load_metadata={"quantization": "none"},
     )
     fake_prepared = SimpleNamespace(
         rendered_text="rendered prompt",
@@ -152,6 +198,9 @@ def test_native_answer_main_saves_raw_prompt_and_passes_nonzero_gate(
     assert exit_code == 0
     assert payload["summary"]["accuracy"] == 1.0
     assert payload["generation"]["policy"]["repetition_penalty"] == 1.0
+    assert payload["requested_attention_backend"] == "eager"
+    assert payload["actual_attention_backend"] == "eager"
+    assert payload["model_loading"]["quantization"] == "none"
     assert payload["records"][0]["raw_prompt"].endswith("Answer:")
     assert payload["records"][0]["rendered_prompt"] == "rendered prompt"
 
@@ -181,14 +230,19 @@ def test_compression_main_saves_three_expected_groups(monkeypatch, tmp_path):
             for ratio in (0.5, 0.3)
         ],
     ]
-    monkeypatch.setattr(
-        compression_script,
-        "run_hf_grid",
-        lambda **kwargs: {
+    captured = {}
+
+    def fake_run_hf_grid(**kwargs):
+        captured.update(kwargs)
+        return {
             "runs": runs,
-            "summary": {"fullkv_parity": {"all_passed": True}},
-        },
-    )
+            "summary": {
+                "fullkv_parity": {"all_passed": True},
+                "qualification": {"passed": True},
+            },
+        }
+
+    monkeypatch.setattr(compression_script, "run_hf_grid", fake_run_hf_grid)
 
     exit_code = compression_script.main(
         ["--model", "fake/model", "--samples", "1", "--output", str(output)]
@@ -197,3 +251,75 @@ def test_compression_main_saves_three_expected_groups(monkeypatch, tmp_path):
 
     assert exit_code == 0
     assert len(payload["gsm8k_foundation_summary"]) == 3
+    assert captured["attn_implementation"] == "eager"
+    assert captured["quantization"] == "none"
+    assert captured["parity_max_samples"] == 5
+
+
+def test_compression_cli_plumbs_t4_quantization_and_cuda_gate(
+    monkeypatch,
+    tmp_path,
+):
+    output = tmp_path / "compression.json"
+    captured = {}
+
+    def fake_run_hf_grid(**kwargs):
+        captured.update(kwargs)
+        return {
+            "runs": [
+                {
+                    "status": "ok",
+                    "method": "fullkv",
+                    "config": {"budget_type": "fullkv", "budget_value": None},
+                    "judgment": {"normalized_prediction": "4", "score": 1.0},
+                    "runtime": {
+                        "total_measured_ms": 10.0,
+                        "decode_tokens_per_second": 5.0,
+                    },
+                },
+                {
+                    "status": "ok",
+                    "method": "tdc_kv",
+                    "config": {"budget_type": "ratio", "budget_value": 0.8},
+                    "judgment": {"normalized_prediction": "4", "score": 1.0},
+                    "runtime": {
+                        "total_measured_ms": 10.0,
+                        "decode_tokens_per_second": 5.0,
+                    },
+                },
+            ],
+            "summary": {
+                "fullkv_parity": {"all_passed": True},
+                "qualification": {"passed": True},
+            },
+        }
+
+    monkeypatch.setattr(compression_script, "run_hf_grid", fake_run_hf_grid)
+
+    exit_code = compression_script.main(
+        [
+            "--model",
+            "fake/7b",
+            "--samples",
+            "20",
+            "--retention-ratios",
+            "0.8",
+            "--quantization",
+            "bnb-4bit",
+            "--bnb-4bit-compute-dtype",
+            "float16",
+            "--parity-samples",
+            "3",
+            "--require-cuda",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["quantization"] == "bnb-4bit"
+    assert captured["bnb_4bit_compute_dtype"] == "float16"
+    assert captured["parity_max_samples"] == 3
+    assert captured["require_model_preflight"] is True
+    assert captured["preflight_require_cuda"] is True
+    assert captured["preflight_require_unquantized"] is False

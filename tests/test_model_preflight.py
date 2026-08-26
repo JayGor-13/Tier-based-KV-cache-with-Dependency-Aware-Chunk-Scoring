@@ -7,9 +7,18 @@ from benchmarks.model_preflight import hub_model_preflight, loaded_model_preflig
 
 
 class TinyModel(torch.nn.Module):
-    def __init__(self, *, sliding_window=None, dtype=torch.float32, backend="eager"):
+    def __init__(
+        self,
+        *,
+        sliding_window=None,
+        dtype=torch.float32,
+        backend="eager",
+        loaded_in_4bit=False,
+        quantization_config=None,
+    ):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(4, 4, dtype=dtype))
+        self.is_loaded_in_4bit = loaded_in_4bit
         self.config = SimpleNamespace(
             max_position_embeddings=4096,
             sliding_window=sliding_window,
@@ -18,6 +27,7 @@ class TinyModel(torch.nn.Module):
             num_key_value_heads=1,
             hidden_size=8,
             _attn_implementation=backend,
+            quantization_config=quantization_config,
         )
 
 
@@ -72,6 +82,15 @@ def test_hub_preflight_resolves_immutable_revision_and_weight_size(monkeypatch):
     assert report["resolved_revision"] == "abc123"
     assert report["repository_weight_bytes"] == 30
 
+    quantized_report = hub_model_preflight(
+        model_name="org/model",
+        revision=None,
+        token="secret",
+        quantization="bnb-4bit",
+    )
+    assert quantized_report["quantization"] == "bnb-4bit"
+    assert quantized_report["estimated_loaded_weight_bytes"] == 7
+
 
 def test_preflight_records_actual_dtype_and_backend():
     report = loaded_model_preflight(
@@ -106,3 +125,47 @@ def test_preflight_rejects_requested_dtype_and_backend_mismatch():
     assert report["passed"] is False
     assert any("requested dtype" in issue for issue in report["issues"])
     assert any("requested attention backend" in issue for issue in report["issues"])
+
+
+def test_preflight_records_intended_4bit_compute_contract():
+    model = TinyModel(
+        dtype=torch.float16,
+        loaded_in_4bit=True,
+        quantization_config={
+            "load_in_4bit": True,
+            "bnb_4bit_compute_dtype": "float16",
+            "bnb_4bit_quant_type": "nf4",
+        },
+    )
+
+    report = loaded_model_preflight(
+        model=model,
+        device=torch.device("cpu"),
+        required_context=128,
+        prefill_block_size=16,
+        require_cuda=False,
+        requested_attention_backend="eager",
+        requested_quantization="bnb-4bit",
+        requested_quantization_compute_dtype="float16",
+        require_unquantized=False,
+    )
+
+    assert report["passed"] is True
+    assert report["loaded_in_4bit"] is True
+    assert report["effective_compute_dtype"] == "torch.float16"
+    assert report["quantization_compute_dtype"] == "torch.float16"
+
+
+def test_preflight_rejects_missing_requested_4bit_loading():
+    report = loaded_model_preflight(
+        model=TinyModel(dtype=torch.float16),
+        device=torch.device("cpu"),
+        required_context=128,
+        prefill_block_size=16,
+        require_cuda=False,
+        requested_quantization="bnb-4bit",
+        requested_quantization_compute_dtype="float16",
+    )
+
+    assert report["passed"] is False
+    assert any("4-bit loading was not resolved" in issue for issue in report["issues"])

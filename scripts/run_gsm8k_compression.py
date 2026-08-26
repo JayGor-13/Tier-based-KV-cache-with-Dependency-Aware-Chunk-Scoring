@@ -54,6 +54,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument(
+        "--attn-implementation",
+        default="eager",
+        help="attention backend; eager is required for attention-score collection",
+    )
+    parser.add_argument(
+        "--quantization",
+        choices=("none", "bnb-4bit"),
+        default="none",
+    )
+    parser.add_argument(
+        "--bnb-4bit-compute-dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float16",
+    )
+    parser.add_argument(
+        "--bnb-4bit-quant-type",
+        choices=("nf4", "fp4"),
+        default="nf4",
+    )
+    parser.add_argument(
+        "--bnb-4bit-double-quant",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--serialization",
         choices=("raw", "auto", "chat"),
         default="raw",
@@ -66,6 +91,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=True,
         help="also verify the custom unpruned path against native HF generation",
     )
+    parser.add_argument(
+        "--parity-samples",
+        type=int,
+        default=5,
+        help="maximum native/custom parity controls; limits full-run overhead",
+    )
+    parser.add_argument(
+        "--require-cuda",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="fail unless CUDA loading and CUDA artifact qualification pass",
+    )
+    parser.add_argument("--max-vram-fraction", type=float, default=0.90)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", default="outputs/gsm8k/compression.json")
     parser.add_argument("--checkpoint", default=None)
@@ -76,6 +114,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--max-new-tokens must be positive")
     if args.max_length <= 0:
         parser.error("--max-length must be positive")
+    if args.parity_samples <= 0:
+        parser.error("--parity-samples must be positive")
+    if not 0.0 < args.max_vram_fraction <= 1.0:
+        parser.error("--max-vram-fraction must be in (0, 1]")
     return args
 
 
@@ -154,6 +196,94 @@ def summarize_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summary
 
 
+def summarize_paired_quality(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compare each compressed answer with its paired FullKV control."""
+    successful = [row for row in runs if row.get("status") == "ok"]
+    fullkv = {
+        str(row.get("sample_id")): row
+        for row in successful
+        if row.get("method") == "fullkv"
+    }
+    compressed: dict[float, list[dict[str, Any]]] = defaultdict(list)
+    for row in successful:
+        if row.get("method") != "tdc_kv":
+            continue
+        config = row.get("config") or {}
+        if config.get("budget_type") != "ratio":
+            continue
+        compressed[float(config["budget_value"])].append(row)
+
+    summaries = []
+    for requested_retention, rows in sorted(compressed.items()):
+        pairs = [
+            (fullkv[str(row.get("sample_id"))], row)
+            for row in rows
+            if str(row.get("sample_id")) in fullkv
+        ]
+        if not pairs:
+            continue
+        full_scores = [
+            float((full.get("judgment") or {}).get("score", 0.0))
+            for full, _compressed in pairs
+        ]
+        compressed_scores = [
+            float((compressed_row.get("judgment") or {}).get("score", 0.0))
+            for _full, compressed_row in pairs
+        ]
+        count = len(pairs)
+        full_correct = sum(score == 1.0 for score in full_scores)
+        compressed_correct = sum(score == 1.0 for score in compressed_scores)
+        preserved = sum(
+            full_score == 1.0 and compressed_score == 1.0
+            for full_score, compressed_score in zip(
+                full_scores,
+                compressed_scores,
+                strict=True,
+            )
+        )
+        regressions = sum(
+            full_score == 1.0 and compressed_score != 1.0
+            for full_score, compressed_score in zip(
+                full_scores,
+                compressed_scores,
+                strict=True,
+            )
+        )
+        recoveries = sum(
+            full_score != 1.0 and compressed_score == 1.0
+            for full_score, compressed_score in zip(
+                full_scores,
+                compressed_scores,
+                strict=True,
+            )
+        )
+        full_accuracy = full_correct / count
+        compressed_accuracy = compressed_correct / count
+        summaries.append(
+            {
+                "retention_ratio": requested_retention,
+                "paired_samples": count,
+                "fullkv_accuracy": full_accuracy,
+                "tdc_kv_accuracy": compressed_accuracy,
+                "accuracy_delta": compressed_accuracy - full_accuracy,
+                "accuracy_retention": (
+                    compressed_accuracy / full_accuracy
+                    if full_accuracy > 0.0
+                    else None
+                ),
+                "fullkv_correct": full_correct,
+                "tdc_kv_correct": compressed_correct,
+                "preserved_fullkv_correct": preserved,
+                "paired_correct_preservation": (
+                    preserved / full_correct if full_correct else None
+                ),
+                "regressions": regressions,
+                "recoveries": recoveries,
+            }
+        )
+    return summaries
+
+
 def _print_summary(rows: list[dict[str, Any]]) -> None:
     print(
         "\nmethod       requested  actual  samples  parse   accuracy  "
@@ -170,6 +300,27 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
             f"{row['parse_rate']:>5.2f}   {row['accuracy']:>8.3f}  "
             f"{row['mean_total_latency_ms']:>10.1f}  "
             f"{throughput if throughput is not None else 0.0:>12.2f}"
+        )
+
+
+def _print_paired_summary(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    print(
+        "\nrequested  pairs  full_em  tdc_em  delta    accuracy_retention  "
+        "preserved  regressions  recoveries"
+    )
+    for row in rows:
+        retention = row["accuracy_retention"]
+        retention_text = "n/a" if retention is None else f"{retention:.3f}"
+        preserved = row["paired_correct_preservation"]
+        preserved_text = "n/a" if preserved is None else f"{preserved:.3f}"
+        print(
+            f"{row['retention_ratio']:>9.2f}  {row['paired_samples']:>5}  "
+            f"{row['fullkv_accuracy']:>7.3f}  {row['tdc_kv_accuracy']:>6.3f}  "
+            f"{row['accuracy_delta']:>+6.3f}  {retention_text:>18}  "
+            f"{preserved_text:>9}  {row['regressions']:>11}  "
+            f"{row['recoveries']:>10}"
         )
 
 
@@ -206,24 +357,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         prefill_block_size=128,
         device=args.device,
         dtype=args.dtype,
-        attn_implementation="eager",
+        attn_implementation=(
+            None
+            if args.attn_implementation.strip().lower() in {"none", "default"}
+            else args.attn_implementation
+        ),
+        quantization=args.quantization,
+        bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+        bnb_4bit_use_double_quant=args.bnb_4bit_double_quant,
         hf_token=os.getenv(args.hf_token_env) if args.hf_token_env else None,
         continue_on_error=False,
         progress=True,
         run_fullkv_parity=args.native_parity,
-        parity_max_samples=args.samples if args.native_parity else None,
+        parity_max_samples=args.parity_samples if args.native_parity else None,
         prompt_serialization=args.serialization,
         truncation_side="right",
         seed=args.seed,
         decode_policy="common_streaming",
         experiment_variant="gsm8k_foundation",
+        require_model_preflight=args.require_cuda,
+        preflight_require_cuda=args.require_cuda,
+        preflight_require_unquantized=(args.quantization == "none"),
+        max_vram_fraction=args.max_vram_fraction,
         checkpoint_path=checkpoint_path,
         resume=args.resume,
     )
     simple_summary = summarize_runs(results.get("runs", []))
+    paired_summary = summarize_paired_quality(results.get("runs", []))
     results["gsm8k_foundation_summary"] = simple_summary
+    results["gsm8k_paired_summary"] = paired_summary
     write_json_atomic(output_path, results)
     _print_summary(simple_summary)
+    _print_paired_summary(paired_summary)
     print(f"\nSaved: {output_path.resolve()}")
 
     expected_groups = 1 + len(args.retention_ratios)
@@ -236,6 +402,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.native_parity and parity.get("all_passed") is not True:
         print("FAIL: custom FullKV does not match native Hugging Face generation.")
         return 3
+    qualification = (results.get("summary") or {}).get("qualification") or {}
+    if args.require_cuda and qualification.get("passed") is not True:
+        print("FAIL: CUDA qualification did not pass.")
+        for failure in qualification.get("failures", []):
+            print(f"- {failure}")
+        return 4
     return 0
 
 

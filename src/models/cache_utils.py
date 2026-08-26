@@ -8,7 +8,7 @@ tensors. This file provides the thin adapter layer from standard
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import math
 from typing import Any, Sequence
@@ -33,6 +33,7 @@ class HfModelBundle:
     model: Any
     tokenizer: Any
     device: torch.device
+    load_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -143,6 +144,35 @@ def resolve_torch_dtype(
     raise ValueError(f"Unsupported dtype `{dtype}`.")
 
 
+def normalize_quantization_mode(quantization: str | None) -> str:
+    """Return the canonical model-weight quantization mode."""
+    normalized = str(quantization or "none").strip().lower().replace("_", "-")
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "false": "none",
+        "bnb-4bit": "bnb-4bit",
+        "bitsandbytes-4bit": "bnb-4bit",
+        "4bit": "bnb-4bit",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "Unsupported quantization mode "
+            f"`{quantization}`. Supported: none, bnb-4bit."
+        ) from exc
+
+
+def _bnb_compute_dtype(dtype: str) -> torch.dtype:
+    resolved = resolve_torch_dtype(dtype, device="cuda")
+    if resolved not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError(
+            "bitsandbytes 4-bit compute dtype must be float16, bfloat16, or float32."
+        )
+    return resolved
+
+
 def resolve_greedy_generation_policy(
     model: Any,
     tokenizer: Any,
@@ -231,6 +261,10 @@ def load_hf_model_and_tokenizer(
     trust_remote_code: bool = False,
     attn_implementation: str | None = None,
     allow_attn_fallback: bool = False,
+    quantization: str = "none",
+    bnb_4bit_compute_dtype: str = "float16",
+    bnb_4bit_quant_type: str = "nf4",
+    bnb_4bit_use_double_quant: bool = True,
 ) -> HfModelBundle:
     """Load a HuggingFace causal LM and tokenizer lazily.
 
@@ -238,7 +272,7 @@ def load_hf_model_and_tokenizer(
     still run unit tests without the optional HF runtime installed.
     """
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     except ModuleNotFoundError as exc:  # pragma: no cover - depends on env
         raise ModuleNotFoundError(
             "HuggingFace support requires `transformers`. Install dependencies "
@@ -247,6 +281,14 @@ def load_hf_model_and_tokenizer(
 
     device_obj = resolve_device(device)
     torch_dtype = resolve_torch_dtype(dtype, device=device_obj)
+    quantization_mode = normalize_quantization_mode(quantization)
+    quant_type = str(bnb_4bit_quant_type).strip().lower()
+    if quant_type not in {"nf4", "fp4"}:
+        raise ValueError("bitsandbytes 4-bit quant type must be `nf4` or `fp4`.")
+    if quantization_mode != "none" and device_obj.type != "cuda":
+        raise ValueError(
+            "bitsandbytes 4-bit loading requires a CUDA device in this pipeline."
+        )
 
     hub_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
     if revision:
@@ -258,7 +300,20 @@ def load_hf_model_and_tokenizer(
         tokenizer.pad_token = tokenizer.eos_token
 
     model_kwargs: dict[str, Any] = dict(hub_kwargs)
-    if str(dtype).strip().lower() == "auto":
+    quantization_compute_dtype: torch.dtype | None = None
+    if quantization_mode == "bnb-4bit":
+        quantization_compute_dtype = _bnb_compute_dtype(bnb_4bit_compute_dtype)
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=quantization_compute_dtype,
+            bnb_4bit_quant_type=quant_type,
+            bnb_4bit_use_double_quant=bool(bnb_4bit_use_double_quant),
+        )
+        model_kwargs["device_map"] = {"": device_obj.index or 0}
+        # Non-quantized modules and computation should use the declared compute
+        # dtype instead of inheriting a BF16 checkpoint dtype on a T4.
+        model_kwargs["dtype"] = quantization_compute_dtype
+    elif str(dtype).strip().lower() == "auto":
         model_kwargs["dtype"] = "auto"
     elif torch_dtype is not None:
         model_kwargs["dtype"] = torch_dtype
@@ -287,7 +342,13 @@ def load_hf_model_and_tokenizer(
         assert last_type_error is not None
         raise last_type_error
 
-    model.to(device_obj)
+    if quantization_mode == "none":
+        model.to(device_obj)
+    elif not bool(getattr(model, "is_loaded_in_4bit", False)):
+        raise RuntimeError(
+            "Requested bitsandbytes 4-bit loading, but the loaded model did not "
+            "report `is_loaded_in_4bit=True`."
+        )
     model.eval()
     if attn_implementation and not allow_attn_fallback:
         actual_attn = getattr(model.config, "_attn_implementation", None)
@@ -296,7 +357,38 @@ def load_hf_model_and_tokenizer(
                 "Requested attention implementation was not honored: "
                 f"requested={attn_implementation!r}, actual={actual_attn!r}."
             )
-    return HfModelBundle(model=model, tokenizer=tokenizer, device=device_obj)
+    return HfModelBundle(
+        model=model,
+        tokenizer=tokenizer,
+        device=device_obj,
+        load_metadata={
+            "quantization": quantization_mode,
+            "requested_dtype": str(dtype),
+            "load_in_4bit": quantization_mode == "bnb-4bit",
+            "bnb_4bit_compute_dtype": (
+                str(quantization_compute_dtype).replace("torch.", "")
+                if quantization_compute_dtype is not None
+                else None
+            ),
+            "bnb_4bit_quant_type": (
+                quant_type if quantization_mode == "bnb-4bit" else None
+            ),
+            "bnb_4bit_use_double_quant": (
+                bool(bnb_4bit_use_double_quant)
+                if quantization_mode == "bnb-4bit"
+                else None
+            ),
+            "requested_attention_backend": attn_implementation,
+            "actual_attention_backend": getattr(
+                model.config, "_attn_implementation", None
+            ),
+            "device_map": (
+                {"": device_obj.index or 0}
+                if quantization_mode == "bnb-4bit"
+                else None
+            ),
+        },
+    )
 
 
 def model_device(model: Any) -> torch.device:
@@ -1253,6 +1345,7 @@ __all__ = [
     "generate_text_with_evicted_cache",
     "load_hf_model_and_tokenizer",
     "model_device",
+    "normalize_quantization_mode",
     "prepare_prompt",
     "resolve_greedy_generation_policy",
     "resolve_device",

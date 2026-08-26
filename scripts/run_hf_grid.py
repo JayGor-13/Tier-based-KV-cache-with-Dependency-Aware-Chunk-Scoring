@@ -120,6 +120,26 @@ def parse_args():
     )
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
     parser.add_argument("--dtype", type=str, default="auto", help="Torch dtype")
+    parser.add_argument(
+        "--quantization",
+        choices=("none", "bnb-4bit"),
+        default="none",
+    )
+    parser.add_argument(
+        "--bnb-4bit-compute-dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float16",
+    )
+    parser.add_argument(
+        "--bnb-4bit-quant-type",
+        choices=("nf4", "fp4"),
+        default="nf4",
+    )
+    parser.add_argument(
+        "--bnb-4bit-double-quant",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--orchestration-job-id",
@@ -292,6 +312,10 @@ def main():
         max_new_tokens=args.max_new_tokens,
         device=args.device,
         dtype=args.dtype,
+        quantization=args.quantization,
+        bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+        bnb_4bit_use_double_quant=args.bnb_4bit_double_quant,
         trust_remote_code=args.trust_remote_code,
         attn_implementation=(
             None
@@ -317,6 +341,7 @@ def main():
         sample_shard_count=args.sample_shard_count,
         require_model_preflight=args.require_model_preflight,
         preflight_require_cuda=args.require_cuda,
+        preflight_require_unquantized=(args.quantization == "none"),
         max_vram_fraction=args.max_vram_fraction,
         deterministic=args.deterministic,
         orchestration_job_id=args.orchestration_job_id,
