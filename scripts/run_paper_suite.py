@@ -83,11 +83,6 @@ ABLATION_DATASETS = ";".join(
         "needle_depth=0.5,seed=29",
     )
 )
-GSM8K_FULL_DATASET = (
-    "name=gsm8k_full,source=openai/gsm8k,config=main,split=test,"
-    "adapter=gsm8k,protocol=chunkkv_gsm8k_8shot,"
-    "prompt_field=question,answer_field=answer"
-)
 
 
 def _attach_frozen_partition(
@@ -233,25 +228,6 @@ def build_jobs(
         args.update({"seed": 42, "experiment-variant": "default"})
         jobs.append(("main", args))
 
-    if profile == "gsm8k_full":
-        args = _base_args(
-            models=models,
-            datasets=_attach_frozen_partition(
-                GSM8K_FULL_DATASET,
-                manifest=protocol_manifest,
-                partition="final",
-            ),
-            samples=max_samples or 1319,
-        )
-        args.update(
-            {
-                "max-length": 2048,
-                "seed": 42,
-                "experiment-variant": "gsm8k_full",
-            }
-        )
-        jobs.append(("gsm8k_full", args))
-
     if profile in {"timing", "all"}:
         for repetition, seed in enumerate((13, 42, 101), start=1):
             args = _base_args(
@@ -337,7 +313,7 @@ def expand_jobs(
     """Split expensive execution profiles into independently resumable jobs."""
     expanded: list[tuple[str, dict[str, Any]]] = []
     for name, arguments in jobs:
-        expensive = name in {"main", "gsm8k_full"} or name.startswith(
+        expensive = name == "main" or name.startswith(
             ("timing_", "ablation_")
         )
         if not expensive:
@@ -426,7 +402,6 @@ def main() -> None:
             "qualification",
             "tuning",
             "main",
-            "gsm8k_full",
             "timing",
             "ablations",
             "all",
@@ -481,11 +456,7 @@ def main() -> None:
     protocol_manifest = Path(options.protocol_manifest).resolve()
     if options.freeze_manifest:
         unique_specs: dict[str, str] = {}
-        freeze_datasets = (
-            GSM8K_FULL_DATASET
-            if options.profile == "gsm8k_full"
-            else f"{QUALIFICATION_DATASETS};{TUNING_DATASETS};{MAIN_DATASETS}"
-        )
+        freeze_datasets = f"{QUALIFICATION_DATASETS};{TUNING_DATASETS};{MAIN_DATASETS}"
         for specification in freeze_datasets.split(";"):
             name = _dataset_name(specification)
             previous = unique_specs.get(name)
@@ -500,8 +471,6 @@ def main() -> None:
             "--output",
             str(protocol_manifest),
         ]
-        if options.profile == "gsm8k_full":
-            freeze_command.extend(("--partitions", "final=1319"))
         completed = subprocess.run(freeze_command, cwd=ROOT, check=False)
         if completed.returncode != 0:
             raise SystemExit(completed.returncode)

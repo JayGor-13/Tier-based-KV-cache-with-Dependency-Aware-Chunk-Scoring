@@ -65,20 +65,3 @@ def test_method_override_limits_every_profile_to_tdc_kv():
 
     assert jobs
     assert {arguments["methods"] for _, arguments in jobs} == {"tdc_kv"}
-
-
-def test_full_gsm8k_profile_uses_entire_frozen_official_test_split():
-    jobs = build_jobs(
-        "gsm8k_full",
-        models="one/model",
-        max_samples=None,
-        protocol_manifest="gsm8k_full_manifest.json",
-    )
-
-    name, arguments = jobs[0]
-    assert name == "gsm8k_full"
-    assert arguments["max-samples"] == 1319
-    assert "split=test" in arguments["datasets"]
-    assert "partition=final" in arguments["datasets"]
-    assert arguments["budget-ratios"] == "0.3,0.2,0.1"
-    assert arguments["methods"] == "fullkv,streamingllm,h2o,snapkv,chunkkv,tdc_kv"
